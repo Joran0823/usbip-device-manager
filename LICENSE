@@ -19,3 +19,19 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Third-Party Notices
+-------------------
+
+This software includes the following third-party assets:
+
+- assets/appicon.ico, assets/appicon.png
+  From wsl-usb-manager (https://github.com/zcj20080882/wsl-usb-manager),
+  Copyright (c) 2024 chuckie, licensed under the MIT License.
+
+- assets/fonts/NotoSansCJKsc-Regular.otf
+  Noto Sans CJK SC, part of the Noto CJK fonts project
+  (https://github.com/notofonts/noto-cjk); designed by Adobe and Google.
+  Copyright and trademark holders are recorded in the font metadata.
+  Licensed under the SIL Open Font License, Version 1.1;
+  the license text is provided in assets/fonts/OFL.txt.

@@ -1,0 +1,37 @@
+[package]
+name = "usbip-device-manager"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust + egui USB/IP device manager for binding/attaching USB devices to WSL via usbipd-win"
+license = "MIT"
+
+[[bin]]
+name = "usbip-device-manager"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
+tray-icon = "0.24"
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+winreg = "0.56"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Globalization",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = "symbols"
