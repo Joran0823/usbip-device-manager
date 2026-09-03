@@ -92,6 +92,7 @@ fn main() {
                          VALUE \"FileDescription\", \"USBIP Device Manager\"\n\
                          VALUE \"FileVersion\", \"{display}\"\n\
                          VALUE \"InternalName\", \"usbip-device-manager\"\n\
+                         VALUE \"LegalCopyright\", \"Copyright (c) 2026 Joran\"\n\
                          VALUE \"OriginalFilename\", \"usbip-device-manager.exe\"\n\
                          VALUE \"ProductName\", \"USBIP Device Manager\"\n\
                          VALUE \"ProductVersion\", \"{display}\"\n\
