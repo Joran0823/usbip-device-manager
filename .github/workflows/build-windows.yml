@@ -42,6 +42,19 @@ jobs:
             echo "app_version=" >> "$GITHUB_OUTPUT"
           fi
 
+      # Release 构建前把 Cargo.toml 版本同步为 tag 版本（去掉 v/V 前缀），
+      # 使编译横幅/包版本与 Release 一致；cargo 会自动同步 Cargo.lock。
+      - name: Sync Cargo.toml version with release tag
+        if: steps.version.outputs.app_version != ''
+        shell: bash
+        env:
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+        run: |
+          ver="${APP_VERSION#v}"
+          ver="${ver#V}"
+          sed -i -E "s/^version = \".*\"/version = \"${ver}\"/" Cargo.toml
+          echo "Cargo.toml version -> ${ver}"
+
       - name: Test
         env:
           USBIP_DEVICE_MANAGER_VERSION: ${{ steps.version.outputs.app_version }}
