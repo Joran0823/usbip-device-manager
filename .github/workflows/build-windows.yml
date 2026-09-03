@@ -17,6 +17,8 @@ jobs:
   build-windows:
     name: Build Windows x64
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,10 +29,27 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Release tag（v*/V*）时把 tag 注入为版本号，供 build.rs 生成
+      # APP_VERSION（如 tag V1.0.0 -> 标题栏/文件版本 V1.0.0）。
+      - name: Resolve version from tag
+        id: version
+        shell: bash
+        run: |
+          ref="${{ github.ref_name }}"
+          if [[ "$ref" == v* || "$ref" == V* ]]; then
+            echo "app_version=${ref}" >> "$GITHUB_OUTPUT"
+          else
+            echo "app_version=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Test
+        env:
+          USBIP_DEVICE_MANAGER_VERSION: ${{ steps.version.outputs.app_version }}
         run: cargo test --release
 
       - name: Build release
+        env:
+          USBIP_DEVICE_MANAGER_VERSION: ${{ steps.version.outputs.app_version }}
         run: cargo build --release
 
       - name: Upload build artifact
@@ -47,4 +66,4 @@ jobs:
         with:
           files: target/release/usbip-device-manager.exe
           fail_on_unmatched_files: true
-          overwrite: true
+          overwrite_files: true

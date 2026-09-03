@@ -236,7 +236,7 @@ impl App {
     }
 
     pub fn window_title(&self) -> String {
-        format!("{} v{}", lang::t("WindowTitle"), crate::APP_VERSION)
+        format!("{} {}", lang::t("WindowTitle"), crate::APP_VERSION)
     }
 
     // ------------------------------------------------------------------

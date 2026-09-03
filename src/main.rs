@@ -15,7 +15,7 @@ mod usbipd;
 
 use eframe::egui;
 
-pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+include!(concat!(env!("OUT_DIR"), "/app_version.rs"));
 
 const MUTEX_NAME: &str = "usbip-device-manager-3f27c19a-2e11-4fc4-9b18-6d3f5d9a6b21";
 
