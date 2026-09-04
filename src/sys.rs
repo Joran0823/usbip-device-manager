@@ -55,11 +55,20 @@ pub struct CmdOutput {
 /// Run a process capturing stdout/stderr, with a timeout in milliseconds.
 /// Returns `exit_code = None` when the process was killed on timeout.
 pub fn run_process(program: &Path, args: &[String], timeout_ms: u64) -> Result<CmdOutput, String> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：release 为无控制台 GUI，禁止控制台子进程
+        // （usbipd.exe 等）新建可见控制台窗口。
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Failed to start {}: {e}", program.display()))?;
 
@@ -118,10 +127,17 @@ pub fn run_process(program: &Path, args: &[String], timeout_ms: u64) -> Result<C
 }
 
 pub fn kill_pid(pid: u32) -> std::io::Result<std::process::Output> {
-    Command::new("taskkill.exe")
+    let mut command = Command::new("taskkill.exe");
+    command
         .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：避免停止守护进程时闪现黑窗。
+        command.creation_flags(0x0800_0000);
+    }
+    command.output()
 }
 
 /// Best-effort check whether a process with `pid` is still alive.

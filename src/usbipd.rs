@@ -631,11 +631,20 @@ impl DaemonManager {
         {
             return Ok(()); // already running
         }
-        let child = Command::new(exe)
+        let mut command = Command::new(exe);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NO_WINDOW：自动附加守护进程是常驻进程，禁止其控制台窗口
+            // 停留在桌面。
+            command.creation_flags(0x0800_0000);
+        }
+        let child = command
             .spawn()
             .map_err(|e| format!("Failed to start auto-attach daemon: {e}"))?;
         self.children.push(DaemonProc {
