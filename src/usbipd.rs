@@ -6,6 +6,7 @@
 
 use crate::config::UsbDevice;
 use crate::lang;
+use crate::log;
 use crate::sys;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -158,15 +159,28 @@ impl Usbipd {
     /// Run usbipd.exe. `privileged = true` triggers a UAC prompt.
     pub fn run(&self, args: &[&str], privileged: bool) -> Result<CmdOut, String> {
         let arg_list: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        log::info(&format!(
+            "usbipd run: {} privileged={privileged}",
+            args.join(" ")
+        ));
         if privileged {
             match sys::run_elevated(&self.exe, &arg_list, 10_000) {
-                Ok(Some(code)) => Ok(CmdOut {
-                    code: exit_code_to_err_code(code as i32),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                }),
-                Ok(None) => Err(lang::t("CanceledByUser")),
-                Err(e) => Err(e),
+                Ok(Some(code)) => {
+                    log::info(&format!("usbipd (elevated) exit code: {code}"));
+                    Ok(CmdOut {
+                        code: exit_code_to_err_code(code as i32),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                }
+                Ok(None) => {
+                    log::info("usbipd (elevated) canceled by user");
+                    Err(lang::t("CanceledByUser"))
+                }
+                Err(e) => {
+                    log::error(&format!("usbipd (elevated) launch failed: {e}"));
+                    Err(e)
+                }
             }
         } else {
             let out = sys::run_process(&self.exe, &arg_list, 10_000)?;
@@ -175,6 +189,12 @@ impl Usbipd {
                 .map(exit_code_to_err_code)
                 .unwrap_or(ErrCode::Timeout);
             let (stdout, stderr) = strip_prefixes(&format!("{}\n{}", out.stdout, out.stderr));
+            log::info(&format!(
+                "usbipd exit: {} -> code={:?}, stderr={}",
+                args.join(" "),
+                code,
+                stderr.trim()
+            ));
             Ok(CmdOut {
                 code,
                 stdout,
@@ -610,15 +630,26 @@ impl DaemonManager {
     }
 
     pub fn prune(&mut self) {
+        let before = self.children.len();
         self.children.retain(|c| sys::is_process_running(c.pid));
+        if self.children.len() < before {
+            log::info(&format!(
+                "daemon prune: removed {} exited auto-attach process(es)",
+                before - self.children.len()
+            ));
+        }
     }
 
     /// true when an `attach` daemon whose arguments contain `needle` is alive.
     pub fn attaching(&mut self, needle: &str) -> bool {
         self.prune();
-        self.children.iter().any(|c| {
-            c.args.contains("attach") && c.args.to_lowercase().contains(&needle.to_lowercase())
-        })
+        for c in &self.children {
+            if c.args.contains("attach") && c.args.to_lowercase().contains(&needle.to_lowercase()) {
+                log::info(&format!("daemon attaching: pid={} args={}", c.pid, c.args));
+                return true;
+            }
+        }
+        false
     }
 
     pub fn spawn_daemon(&mut self, exe: &Path, args: &[&str]) -> Result<(), String> {
@@ -629,6 +660,7 @@ impl DaemonManager {
             .iter()
             .any(|c| c.args.eq_ignore_ascii_case(&joined))
         {
+            log::info(&format!("daemon already running, skip spawn: {joined}"));
             return Ok(()); // already running
         }
         let mut command = Command::new(exe);
@@ -647,6 +679,11 @@ impl DaemonManager {
         let child = command
             .spawn()
             .map_err(|e| format!("Failed to start auto-attach daemon: {e}"))?;
+        log::info(&format!(
+            "auto-attach daemon started: pid={} args={}",
+            child.id(),
+            joined
+        ));
         self.children.push(DaemonProc {
             pid: child.id(),
             args: joined,
@@ -664,6 +701,7 @@ impl DaemonManager {
             .collect();
         for pid in victims {
             let _ = sys::kill_pid(pid);
+            log::info(&format!("stopping auto-attach daemon: pid={pid}"));
         }
         self.children
             .retain(|c| !c.args.to_lowercase().contains(&lower) || !sys::is_process_running(c.pid));
@@ -671,6 +709,9 @@ impl DaemonManager {
 
     pub fn stop_all(&mut self) {
         let pids: Vec<u32> = self.children.iter().map(|c| c.pid).collect();
+        if !pids.is_empty() {
+            log::info(&format!("stopping all auto-attach daemons: {pids:?}"));
+        }
         for pid in pids {
             let _ = sys::kill_pid(pid);
         }
@@ -703,37 +744,57 @@ pub fn bind_device(
 ) -> Result<(), String> {
     let id = id_of(dev, use_bus_id);
     if id.trim().is_empty() {
+        log::error("bind aborted: id is empty");
         return Err(format!(
             "{} is empty.",
             if use_bus_id { "BusID" } else { "HardwareID" }
         ));
     }
     if !dev.is_connected {
+        log::warn(&format!("bind aborted: device {id} is not connected"));
         return Err(format!("Device({id}) is not connected."));
     }
     if dev.is_bound {
+        log::info(&format!("bind skipped: device {id} is already bound"));
         return Ok(());
     }
 
+    log::info(&format!(
+        "bind start: id={id} force={force} hardware_id={}",
+        dev.hardware_id
+    ));
     let mut last = usbipd.bind(&id, use_bus_id, force)?;
     let mut bound = false;
-    for _ in 0..3 {
-        if let Ok(list) = usbipd.list_devices() {
-            if let Some(updated) = find_device(&list, &dev.hardware_id) {
-                bound = updated.is_bound;
-                if bound {
-                    break;
+    for round in 1..=3 {
+        match usbipd.list_devices() {
+            Ok(list) => {
+                if let Some(updated) = find_device(&list, &dev.hardware_id) {
+                    bound = updated.is_bound;
+                    log::info(&format!("bind poll {round}: id={id} bound={bound}"));
+                    if bound {
+                        break;
+                    }
+                } else {
+                    log::warn(&format!(
+                        "bind poll {round}: device {} not found in usbipd state",
+                        dev.hardware_id
+                    ));
                 }
             }
+            Err(e) => log::warn(&format!("bind poll {round}: list_devices failed: {e}")),
         }
         std::thread::sleep(Duration::from_millis(500));
         last = usbipd.bind(&id, use_bus_id, force)?;
     }
     if bound {
+        log::info(&format!("bind success: id={id}"));
         Ok(())
     } else if last.code != ErrCode::Success {
-        Err(format!("Failed to bind: {}", last.stderr))
+        let msg = format!("Failed to bind: {}", last.stderr);
+        log::error(&msg);
+        Err(msg)
     } else {
+        log::error(&format!("bind failed after retries: id={id}"));
         Err("Failed to bind the device.".to_owned())
     }
 }
@@ -746,14 +807,20 @@ pub fn unbind_device(
 ) -> Result<(), String> {
     let id = id_of(dev, use_bus_id);
     if id.trim().is_empty() {
+        log::error("unbind aborted: id is empty");
         return Err(format!(
             "{} is empty.",
             if use_bus_id { "BusID" } else { "HardwareID" }
         ));
     }
     if !dev.is_bound {
+        log::info(&format!("unbind skipped: device {id} is not bound"));
         return Ok(());
     }
+    log::info(&format!(
+        "unbind start: id={id} connected={} hardware_id={}",
+        dev.is_connected, dev.hardware_id
+    ));
     let out = usbipd.unbind(&id, use_bus_id)?;
     let mut unbound = false;
     if !dev.is_connected {
@@ -774,10 +841,14 @@ pub fn unbind_device(
         dm.stop_matching(&dev.hardware_id);
     }
     if unbound {
+        log::info(&format!("unbind success: id={id}"));
         Ok(())
     } else if out.code != ErrCode::Success {
-        Err(format!("Failed to unbind: {}", out.stderr))
+        let msg = format!("Failed to unbind: {}", out.stderr);
+        log::error(&msg);
+        Err(msg)
     } else {
+        log::error(&format!("unbind failed: id={id}"));
         Err("Failed to unbind the device.".to_owned())
     }
 }
@@ -815,6 +886,11 @@ pub fn attach_device(
     if !dev.is_connected {
         return Err(format!("Device({id}) is not connected."));
     }
+    log::info(&format!(
+        "attach start: id={id} auto={auto} use_bus_id={use_bus_id} host_ip={host_ip:?} \
+         connected={} bound={} attached={}",
+        dev.is_connected, dev.is_bound, dev.is_attached
+    ));
 
     let mut cur = dev.clone();
     if !cur.is_bound {
@@ -830,10 +906,12 @@ pub fn attach_device(
             }
         }
         if !cur.is_bound {
+            log::error(&format!("attach aborted: id={id} is not bound"));
             return Err(format!("Device({id}) is not bound."));
         }
     }
     if cur.is_attached {
+        log::info(&format!("attach skipped: id={id} is already attached"));
         return Ok(String::new());
     }
 
@@ -841,6 +919,9 @@ pub fn attach_device(
         .lock()
         .map(|mut dm| dm.attaching(&id))
         .unwrap_or(false);
+    log::info(&format!(
+        "attach daemon in progress for id={id}: {in_progress}"
+    ));
     if !in_progress {
         let out = usbipd.attach(&id, use_bus_id, host_ip)?;
         if out.code != ErrCode::Success {
@@ -850,24 +931,39 @@ pub fn attach_device(
 
     let mut attached = false;
     for i in 1..=10 {
-        if let Ok(list) = usbipd.list_devices() {
-            if let Some(u) = find_device(&list, &cur.hardware_id) {
-                attached = u.is_attached;
-                if attached {
-                    break;
+        match usbipd.list_devices() {
+            Ok(list) => {
+                if let Some(u) = find_device(&list, &cur.hardware_id) {
+                    attached = u.is_attached;
+                    log::info(&format!("attach poll {i}: id={id} attached={attached}"));
+                    if attached {
+                        break;
+                    }
+                } else {
+                    log::warn(&format!(
+                        "attach poll {i}: device {} not found in usbipd state",
+                        cur.hardware_id
+                    ));
                 }
             }
+            Err(e) => log::warn(&format!("attach poll {i}: list_devices failed: {e}")),
         }
         if !in_progress && i % 3 == 0 {
+            log::info(&format!(
+                "attach retry {i}: launching usbipd attach for id={id}"
+            ));
             let out = usbipd.attach(&id, use_bus_id, host_ip)?;
             if out.code != ErrCode::Success {
-                return Err(translate_attach_error(&out.stderr));
+                let e = translate_attach_error(&out.stderr);
+                log::error(&format!("attach retry {i} failed: {e}"));
+                return Err(e);
             }
         }
         std::thread::sleep(Duration::from_millis(500));
     }
 
     if attached {
+        log::info(&format!("attach success: id={id} auto={auto}"));
         if auto {
             // Keep usbipd watching for replugs.
             let mut args = vec![
@@ -890,13 +986,18 @@ pub fn attach_device(
             let borrowed: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
             if let Ok(mut dm) = daemons.lock() {
                 if let Err(e) = dm.spawn_daemon(&exe, &borrowed) {
+                    log::error(&format!("failed to start auto-attach daemon: {e}"));
                     return Err(e);
                 }
             }
         }
         Ok(lang::t("AutoAttachDaemonExit"))
     } else {
-        Err(translate_attach_error(&lang::t("ErrMsgAttachFail")))
+        let e = translate_attach_error(&lang::t("ErrMsgAttachFail"));
+        log::error(&format!(
+            "attach failed after polls: id={id} auto={auto} in_progress={in_progress} error={e}"
+        ));
+        Err(e)
     }
 }
 
@@ -908,30 +1009,45 @@ pub fn detach_device(
 ) -> Result<(), String> {
     let id = id_of(dev, use_bus_id);
     if id.trim().is_empty() {
+        log::error("detach aborted: id is empty");
         return Err(format!(
             "{} is empty.",
             if use_bus_id { "BusID" } else { "HardwareID" }
         ));
     }
     if !dev.is_connected {
+        log::warn(&format!("detach aborted: device {id} is not connected"));
         return Err(format!("Device({id}) is not connected."));
     }
     if !dev.is_attached {
+        log::info(&format!("detach skipped: id={id} is not attached"));
         return Ok(());
     }
+    log::info(&format!(
+        "detach start: id={id} hardware_id={}",
+        dev.hardware_id
+    ));
     let out = usbipd.detach(&id, use_bus_id)?;
     let mut detached = false;
-    for _ in 0..10 {
-        if let Ok(list) = usbipd.list_devices() {
-            if let Some(u) = find_device(&list, &dev.hardware_id) {
-                detached = !u.is_attached;
-                if detached {
+    for i in 1..=10 {
+        match usbipd.list_devices() {
+            Ok(list) => {
+                if let Some(u) = find_device(&list, &dev.hardware_id) {
+                    detached = !u.is_attached;
+                    log::info(&format!("detach poll {i}: id={id} detached={detached}"));
+                    if detached {
+                        break;
+                    }
+                } else {
+                    detached = true;
+                    log::info(&format!(
+                        "detach poll {i}: device {} no longer in usbipd state",
+                        dev.hardware_id
+                    ));
                     break;
                 }
-            } else {
-                detached = true;
-                break;
             }
+            Err(e) => log::warn(&format!("detach poll {i}: list_devices failed: {e}")),
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -939,10 +1055,14 @@ pub fn detach_device(
         dm.stop_matching(&dev.hardware_id);
     }
     if detached {
+        log::info(&format!("detach success: id={id}"));
         Ok(())
     } else if out.code != ErrCode::Success {
-        Err(format!("Failed to detach: {}", out.stderr))
+        let msg = format!("Failed to detach: {}", out.stderr);
+        log::error(&msg);
+        Err(msg)
     } else {
+        log::error(&format!("detach failed after polls: id={id}"));
         Err("Failed to detach the device.".to_owned())
     }
 }

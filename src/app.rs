@@ -259,6 +259,10 @@ impl App {
                 }
                 UiMsg::Lists(devices) => {
                     self.busy = false;
+                    log::info(&format!(
+                        "list refreshed: {} device(s) from usbipd state",
+                        devices.len()
+                    ));
                     self.apply_lists(devices);
                     ctx.request_repaint();
                 }
@@ -280,6 +284,10 @@ impl App {
                 }
                 UiMsg::OpDone { ok, message } => {
                     self.busy = false;
+                    log::info(&format!(
+                        "operation finished: ok={ok} message={}",
+                        message.trim()
+                    ));
                     if ok {
                         self.toasts.push(Toast {
                             kind: ToastKind::Success,
@@ -364,6 +372,14 @@ impl App {
             });
         }
         self.auto_rows = auto;
+        let hidden = self.device_rows.iter().filter(|r| r.is_filtered).count();
+        log::info(&format!(
+            "list applied: connected={} persisted={} auto_list={} hidden={}",
+            self.device_rows.len(),
+            self.persisted_rows.len(),
+            self.auto_rows.len(),
+            hidden
+        ));
         self.restore_selections();
         self.initialized = true;
         self.maybe_auto_attach();
@@ -421,12 +437,24 @@ impl App {
                 .get(&row.dev.hardware_id)
                 .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(8));
             if attaching || recent {
+                log::info(&format!(
+                    "auto attach deferred: id={id} daemon_attaching={attaching} recent_attempt={recent}"
+                ));
                 continue;
             }
             candidate = Some(row.dev.clone());
             break;
         }
         if let Some(dev) = candidate {
+            log::info(&format!(
+                "auto attach trigger: id={} hardware_id={}",
+                if self.cfg.app_config.use_bus_id {
+                    dev.bus_id.clone()
+                } else {
+                    dev.hardware_id.clone()
+                },
+                dev.hardware_id
+            ));
             self.pending_attach.insert(dev.hardware_id.clone(), now);
             self.attach(dev, true);
         }
@@ -447,13 +475,23 @@ impl App {
         };
         self.busy = true;
         let tx = self.tx.clone();
+        let started = std::time::Instant::now();
         std::thread::Builder::new()
             .name("refresh".to_owned())
             .spawn(move || match client.list_devices() {
                 Ok(list) => {
+                    log::info(&format!(
+                        "refresh OK: {} device(s) in {} ms",
+                        list.len(),
+                        started.elapsed().as_millis()
+                    ));
                     let _ = tx.send(UiMsg::Lists(list));
                 }
                 Err(e) => {
+                    log::warn(&format!(
+                        "refresh failed after {} ms: {e}",
+                        started.elapsed().as_millis()
+                    ));
                     let _ = tx.send(UiMsg::Error(e));
                     let _ = tx.send(UiMsg::Lists(Vec::new()));
                 }
@@ -789,6 +827,10 @@ impl App {
     /// 接收 USB 插拔事件：短时间内的事件先合并，冷却结束后只刷新一次，
     /// 避免复合设备枚举时连续多次调用 usbipd state。
     pub fn queue_usb_change(&mut self, change: UsbChange, ctx: &egui::Context) {
+        log::info(&format!(
+            "USB change queued: {} connected={}",
+            change.hardware_id, change.connected
+        ));
         self.pending_usb = Some(change);
         ctx.request_repaint_after(Duration::from_millis(120));
     }
@@ -806,10 +848,18 @@ impl App {
             .last_usb_refresh
             .is_some_and(|t| t.elapsed() < Duration::from_millis(900))
         {
+            log::info(&format!(
+                "USB change deferred (cooldown): {} connected={}",
+                change.hardware_id, change.connected
+            ));
             self.pending_usb = Some(change);
             ctx.request_repaint_after(Duration::from_millis(150));
             return;
         }
+        log::info(&format!(
+            "USB change processing: {} connected={}",
+            change.hardware_id, change.connected
+        ));
         self.last_usb_refresh = Some(Instant::now());
         self.usb_listing = true;
         self.start_usb_list(change, ctx);
@@ -828,8 +878,9 @@ impl App {
             .spawn(move || match client.list_devices() {
                 Ok(list) => {
                     log::info(&format!(
-                        "USB change {} -> refreshed {} device(s) in {} ms",
+                        "USB change {} (connected={}) -> refreshed {} device(s) in {} ms",
                         change.hardware_id,
+                        change.connected,
                         list.len(),
                         started.elapsed().as_millis()
                     ));

@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::log;
 use crate::sys;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,12 +36,14 @@ impl UsbMonitor {
                     std::thread::sleep(Duration::from_millis(250));
                     let current: HashSet<String> = sys::usb_hardware_ids().into_iter().collect();
                     for id in current.difference(&previous) {
+                        log::info(&format!("USB device plugged: {id}"));
                         cb(UsbChange {
                             hardware_id: id.clone(),
                             connected: true,
                         });
                     }
                     for id in previous.difference(&current) {
+                        log::info(&format!("USB device unplugged: {id}"));
                         cb(UsbChange {
                             hardware_id: id.clone(),
                             connected: false,
