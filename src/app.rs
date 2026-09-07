@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 
 // USB 广播事件触发 usbipd state 查询的去抖 / 补查参数。
 /// 广播风暴后等待枚举稳定再查询的冷却时间。
-const USB_EVENT_COOLDOWN: Duration = Duration::from_millis(900);
+const USB_EVENT_COOLDOWN: Duration = Duration::from_millis(400);
 /// 查询后 state 未变化的自动补查间隔。
-const USB_RECHECK_INTERVAL: Duration = Duration::from_millis(600);
+const USB_RECHECK_INTERVAL: Duration = Duration::from_millis(300);
 /// 单次广播触发后最多自动补查次数（state 相对广播有短暂滞后）。
-const USB_RECHECK_LIMIT: u8 = 2;
+const USB_RECHECK_LIMIT: u8 = 3;
 /// auto 设备插入后未附加时的兜底检查间隔（静默查询 usbipd state）。
 const AUTO_WATCH_INTERVAL: Duration = Duration::from_millis(200);
 /// 兜底检查总轮数：每轮查询一次，未附加则执行一次附加。

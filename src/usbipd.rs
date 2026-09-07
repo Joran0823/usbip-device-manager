@@ -824,6 +824,20 @@ fn find_device<'a>(list: &'a [UsbDevice], hardware_id: &str) -> Option<&'a UsbDe
         .find(|d| d.hardware_id.eq_ignore_ascii_case(hardware_id))
 }
 
+/// 是否存在“已附加”的设备：优先按 InstanceId 精确匹配；否则只要同
+/// VID:PID（可能有多台同型号设备）中任意一台已附加即视为已附加。
+fn is_attached_in(list: &[UsbDevice], hardware_id: &str, instance_id: &str) -> bool {
+    list.iter().any(|d| {
+        if !d.is_attached {
+            return false;
+        }
+        if !instance_id.is_empty() && d.instance_id.eq_ignore_ascii_case(instance_id) {
+            return true;
+        }
+        !hardware_id.is_empty() && d.hardware_id.eq_ignore_ascii_case(hardware_id)
+    })
+}
+
 pub fn bind_device(
     usbipd: &Usbipd,
     dev: &UsbDevice,
@@ -983,6 +997,7 @@ fn run_attach_cmd(
     use_bus_id: bool,
     host_ip: Option<&str>,
     hardware_id: &str,
+    instance_id: &str,
 ) -> Result<CmdOut, String> {
     let out = usbipd.attach(id, use_bus_id, host_ip)?;
     if out.code == ErrCode::Success || !is_already_attached_error(&out.stderr) {
@@ -992,17 +1007,15 @@ fn run_attach_cmd(
     std::thread::sleep(Duration::from_millis(50));
     if !hardware_id.is_empty() {
         if let Ok(list) = usbipd.list_devices() {
-            if let Some(u) = find_device(&list, hardware_id) {
-                if u.is_attached {
-                    log::info(&format!(
-                        "attach confirmed already attached (50 ms re-check): id={id}"
-                    ));
-                    return Ok(CmdOut {
-                        code: ErrCode::Success,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                    });
-                }
+            if is_attached_in(&list, hardware_id, instance_id) {
+                log::info(&format!(
+                    "attach confirmed already attached (50 ms re-check): id={id}"
+                ));
+                return Ok(CmdOut {
+                    code: ErrCode::Success,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
             }
         }
     }
@@ -1083,12 +1096,26 @@ pub fn attach_device(
     ));
     let mut attached = false;
     let mut last_err: Option<String> = None;
+    let mut already_attached_seen = false;
 
     if !in_progress {
-        let mut out = run_attach_cmd(usbipd, &id, use_bus_id, host_ip, &cur.hardware_id)?;
+        let mut out = run_attach_cmd(
+            usbipd,
+            &id,
+            use_bus_id,
+            host_ip,
+            &cur.hardware_id,
+            &cur.instance_id,
+        )?;
+        // usbipd attach 返回成功即视为已附加：不再等 state 轮询确认，
+        // 避免“命令已成功但 state 延迟/匹配歧义”导致 UI 延迟数秒。
+        if out.code == ErrCode::Success {
+            attached = true;
+        }
         let mut attempt = 0;
         while out.code != ErrCode::Success && attempt < 5 {
             if is_already_attached_error(&out.stderr) {
+                already_attached_seen = true;
                 // 竞态且 50ms 复查未确认：交由下方 state 轮询继续确认。
                 log::info(&format!(
                     "attach still reports already attached, verifying via state: id={id}"
@@ -1107,12 +1134,25 @@ pub fn attach_device(
             std::thread::sleep(Duration::from_millis(1000));
             // 重试前先看设备是否其实已经被附加（例如旧守护进程已完成）。
             if let Ok(list) = usbipd.list_devices() {
-                if find_device(&list, &cur.hardware_id).is_some_and(|u| u.is_attached) {
+                if is_attached_in(&list, &cur.hardware_id, &cur.instance_id) {
                     attached = true;
                     break;
                 }
             }
-            out = run_attach_cmd(usbipd, &id, use_bus_id, host_ip, &cur.hardware_id)?;
+            out = run_attach_cmd(
+                usbipd,
+                &id,
+                use_bus_id,
+                host_ip,
+                &cur.hardware_id,
+                &cur.instance_id,
+            )?;
+            if out.code == ErrCode::Success {
+                attached = true;
+            }
+        }
+        if out.code == ErrCode::Success {
+            attached = true;
         }
         if !attached && out.code != ErrCode::Success {
             if is_transient_attach_error(&out.stderr) {
@@ -1129,13 +1169,15 @@ pub fn attach_device(
         }
         match usbipd.list_devices() {
             Ok(list) => {
-                if let Some(u) = find_device(&list, &cur.hardware_id) {
-                    attached = u.is_attached;
-                    log::info(&format!("attach poll {i}: id={id} attached={attached}"));
-                    if attached {
-                        break;
-                    }
-                } else {
+                attached = is_attached_in(&list, &cur.hardware_id, &cur.instance_id);
+                log::info(&format!("attach poll {i}: id={id} attached={attached}"));
+                if attached {
+                    break;
+                }
+                if !list.iter().any(|d| {
+                    d.instance_id.eq_ignore_ascii_case(&cur.instance_id)
+                        || d.hardware_id.eq_ignore_ascii_case(&cur.hardware_id)
+                }) {
                     log::warn(&format!(
                         "attach poll {i}: device {} not found in usbipd state",
                         cur.hardware_id
@@ -1144,20 +1186,41 @@ pub fn attach_device(
             }
             Err(e) => log::warn(&format!("attach poll {i}: list_devices failed: {e}")),
         }
-        if !in_progress && (last_err.is_some() || i % 3 == 0) {
+        // “already attached”说明 usbipd 侧已附加成功，只是 state 尚未反映
+        // （常见于同 VID:PID 多设备匹配歧义）：只轮询等待，不再反复 attach。
+        let stop_retrying = last_err.as_deref().is_some_and(is_already_attached_error);
+        if !in_progress && !stop_retrying && (last_err.is_some() || i % 3 == 0) {
             log::info(&format!(
                 "attach retry {i}: launching usbipd attach for id={id}"
             ));
-            let out = run_attach_cmd(usbipd, &id, use_bus_id, host_ip, &cur.hardware_id)?;
+            let out = run_attach_cmd(
+                usbipd,
+                &id,
+                use_bus_id,
+                host_ip,
+                &cur.hardware_id,
+                &cur.instance_id,
+            )?;
             if out.code != ErrCode::Success {
                 log::info(&format!(
                     "attach retry {i} still failing: id={id} stderr={}",
                     out.stderr.trim()
                 ));
+                if is_already_attached_error(&out.stderr) {
+                    already_attached_seen = true;
+                }
                 last_err = Some(out.stderr.clone());
             }
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+    if !attached && already_attached_seen {
+        // usbipd 明确报告已附加，只是 state 轮询一直没确认（例如同
+        // VID:PID 多设备）：按成功处理，避免拖住 UI 数秒。
+        log::info(&format!(
+            "attach: usbipd reports already attached; treating as success: id={id}"
+        ));
+        attached = true;
     }
 
     if attached {
