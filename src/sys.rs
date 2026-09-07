@@ -475,7 +475,7 @@ pub fn usb_instance_ids() -> Vec<String> {
             ) != 0
             {
                 let id = from_wide(buf.as_ptr());
-                if !id.trim().is_empty() {
+                if is_bindable_usb_instance(&id) {
                     ids.push(id);
                 }
             }
@@ -485,4 +485,12 @@ pub fn usb_instance_ids() -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+/// usbipd-win 可管理的 USB 设备节点：实例 ID 形如
+/// `USB\VID_xxxx&PID_yyyy\...`，排除 hub（无 VID/PID）和复合设备的功能
+/// 子节点（含 `&MI_xx`），以便与 `usbipd state` 的 InstanceId 对齐。
+fn is_bindable_usb_instance(instance_id: &str) -> bool {
+    let upper = instance_id.to_ascii_uppercase();
+    upper.contains("\\VID_") && upper.contains("&PID_") && !upper.contains("&MI_")
 }
