@@ -25,6 +25,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.process_messages(ctx);
         self.flush_usb_change(ctx);
+        self.poll_reattach_check(ctx);
         if self.is_exiting() {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;

@@ -110,6 +110,10 @@ pub struct App {
     initialized: bool,
     pub(crate) need_refresh: bool,
     pending_attach: HashMap<String, Instant>,
+    /// 设备重插后“已连接但未附加”的连续检查次数（按 hardware id）。
+    unattached_checks: HashMap<String, u32>,
+    /// 首次检查发现守护进程存在但设备未附加时，安排一次稍后的复查。
+    reattach_check_at: Option<(String, Instant)>,
     pending_usb: Option<UsbChange>,
     last_usb_refresh: Option<Instant>,
     usb_listing: bool,
@@ -159,6 +163,8 @@ impl App {
             initialized: false,
             need_refresh: false,
             pending_attach: HashMap::new(),
+            unattached_checks: HashMap::new(),
+            reattach_check_at: None,
             pending_usb: None,
             last_usb_refresh: None,
             usb_listing: false,
@@ -417,15 +423,30 @@ impl App {
             return;
         }
         let now = Instant::now();
-        let mut candidate: Option<UsbDevice> = None;
+        let mut normal: Option<UsbDevice> = None;
+        let mut force: Option<UsbDevice> = None;
         for row in &self.device_rows {
-            if !row.is_auto || !row.dev.is_connected || row.dev.is_attached {
+            if !row.is_auto || !row.dev.is_connected {
+                continue;
+            }
+            let hwid = row.dev.hardware_id.clone();
+            if row.dev.is_attached {
+                if self.unattached_checks.remove(&hwid).is_some() {
+                    log::info(&format!(
+                        "auto attach: {hwid} attached, check counter reset"
+                    ));
+                }
+                if let Some((scheduled, _)) = self.reattach_check_at.as_ref() {
+                    if scheduled.eq_ignore_ascii_case(&hwid) {
+                        self.reattach_check_at = None;
+                    }
+                }
                 continue;
             }
             let id = if self.cfg.app_config.use_bus_id {
                 row.dev.bus_id.clone()
             } else {
-                row.dev.hardware_id.clone()
+                hwid.clone()
             };
             let attaching = self
                 .daemons
@@ -434,18 +455,46 @@ impl App {
                 .unwrap_or(false);
             let recent = self
                 .pending_attach
-                .get(&row.dev.hardware_id)
+                .get(&hwid)
                 .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(8));
-            if attaching || recent {
-                log::info(&format!(
-                    "auto attach deferred: id={id} daemon_attaching={attaching} recent_attempt={recent}"
-                ));
-                continue;
+            let entry = self.unattached_checks.entry(hwid.clone()).or_insert(0);
+            *entry += 1;
+            let count = *entry;
+            log::info(&format!(
+                "auto attach check {count}: id={id} daemon_attaching={attaching} recent_attempt={recent}"
+            ));
+            if count >= 2 {
+                if force.is_none() {
+                    force = Some(row.dev.clone());
+                }
+            } else if attaching {
+                // 守护进程仍驻留但设备未附加：安排一次复查作为第二次“检查”。
+                if self.reattach_check_at.is_none() {
+                    log::info(&format!(
+                        "auto attach: scheduling re-check for id={id} in 2s"
+                    ));
+                    self.reattach_check_at = Some((hwid.clone(), now + Duration::from_secs(2)));
+                }
+            } else if !recent && normal.is_none() {
+                normal = Some(row.dev.clone());
             }
-            candidate = Some(row.dev.clone());
-            break;
         }
-        if let Some(dev) = candidate {
+
+        if let Some(dev) = force {
+            log::info(&format!(
+                "auto attach force trigger (2 checks unattached): id={} hardware_id={}",
+                if self.cfg.app_config.use_bus_id {
+                    dev.bus_id.clone()
+                } else {
+                    dev.hardware_id.clone()
+                },
+                dev.hardware_id
+            ));
+            self.pending_attach.insert(dev.hardware_id.clone(), now);
+            self.unattached_checks.remove(&dev.hardware_id);
+            self.reattach_check_at = None;
+            self.attach(dev, true, true);
+        } else if let Some(dev) = normal {
             log::info(&format!(
                 "auto attach trigger: id={} hardware_id={}",
                 if self.cfg.app_config.use_bus_id {
@@ -456,7 +505,8 @@ impl App {
                 dev.hardware_id
             ));
             self.pending_attach.insert(dev.hardware_id.clone(), now);
-            self.attach(dev, true);
+            self.unattached_checks.remove(&dev.hardware_id);
+            self.attach(dev, true, false);
         }
     }
 
@@ -562,7 +612,7 @@ impl App {
                 Action::Unbind(hwid) => self.unbind_by_hwid(&hwid),
                 Action::Attach(hwid) => {
                     if let Some(dev) = self.find_dev(&hwid).cloned() {
-                        self.attach(dev, false);
+                        self.attach(dev, false, false);
                     }
                 }
                 Action::Detach(hwid) => {
@@ -698,7 +748,7 @@ impl App {
         );
     }
 
-    pub fn attach(&mut self, dev: UsbDevice, auto: bool) {
+    pub fn attach(&mut self, dev: UsbDevice, auto: bool, force: bool) {
         let Some(client) = self.usbipd.clone() else {
             return;
         };
@@ -733,6 +783,7 @@ impl App {
                     auto,
                     host_ip.as_deref(),
                     &daemons,
+                    force,
                 );
                 done(r.map_err(|e| format!("{}: {e}", lang::t("ErrMsgAttachFail"))));
             },
@@ -776,7 +827,7 @@ impl App {
         // 与 C# 版 AddToAutoAttach 一致：加入列表后立即进入附加流程。
         // 未绑定时由 attach_device 先执行 usbipd bind，再执行 attach。
         if dev.is_connected {
-            self.attach(dev, true);
+            self.attach(dev, true, false);
         }
     }
 
@@ -831,6 +882,21 @@ impl App {
             "USB change queued: {} connected={}",
             change.hardware_id, change.connected
         ));
+        if !change.connected {
+            // 设备拔出后守护进程保持驻留（usbipd 官方语义）；
+            // 仅重置“未附加检查”计数，重插后重新计数。
+            if self.unattached_checks.remove(&change.hardware_id).is_some() {
+                log::info(&format!(
+                    "USB unplug: reset unattached check counter for {}",
+                    change.hardware_id
+                ));
+            }
+            if let Some((hwid, _)) = self.reattach_check_at.as_ref() {
+                if hwid.eq_ignore_ascii_case(&change.hardware_id) {
+                    self.reattach_check_at = None;
+                }
+            }
+        }
         self.pending_usb = Some(change);
         ctx.request_repaint_after(Duration::from_millis(120));
     }
@@ -863,6 +929,21 @@ impl App {
         self.last_usb_refresh = Some(Instant::now());
         self.usb_listing = true;
         self.start_usb_list(change, ctx);
+    }
+
+    /// 守护进程驻留但设备未附加时安排的复查到点后，触发一次列表刷新，
+    /// 由 apply_lists -> maybe_auto_attach 形成“第二次检查”。
+    pub(crate) fn poll_reattach_check(&mut self, ctx: &egui::Context) {
+        let Some((hwid, at)) = self.reattach_check_at.clone() else {
+            return;
+        };
+        if Instant::now() < at || self.is_busy() {
+            return;
+        }
+        log::info(&format!("auto attach re-check due: {hwid}"));
+        self.reattach_check_at = None;
+        self.need_refresh = true;
+        ctx.request_repaint();
     }
 
     fn start_usb_list(&mut self, change: UsbChange, ctx: &egui::Context) {

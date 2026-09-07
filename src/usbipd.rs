@@ -875,6 +875,7 @@ pub fn attach_device(
     auto: bool,
     host_ip: Option<&str>,
     daemons: &Mutex<DaemonManager>,
+    force: bool,
 ) -> Result<String, String> {
     let id = id_of(dev, use_bus_id);
     if id.trim().is_empty() {
@@ -887,7 +888,7 @@ pub fn attach_device(
         return Err(format!("Device({id}) is not connected."));
     }
     log::info(&format!(
-        "attach start: id={id} auto={auto} use_bus_id={use_bus_id} host_ip={host_ip:?} \
+        "attach start: id={id} auto={auto} force={force} use_bus_id={use_bus_id} host_ip={host_ip:?} \
          connected={} bound={} attached={}",
         dev.is_connected, dev.is_bound, dev.is_attached
     ));
@@ -915,12 +916,13 @@ pub fn attach_device(
         return Ok(String::new());
     }
 
-    let in_progress = daemons
-        .lock()
-        .map(|mut dm| dm.attaching(&id))
-        .unwrap_or(false);
+    let in_progress = !force
+        && daemons
+            .lock()
+            .map(|mut dm| dm.attaching(&id))
+            .unwrap_or(false);
     log::info(&format!(
-        "attach daemon in progress for id={id}: {in_progress}"
+        "attach daemon in progress for id={id}: {in_progress} (force={force})"
     ));
     if !in_progress {
         let out = usbipd.attach(&id, use_bus_id, host_ip)?;
@@ -963,8 +965,18 @@ pub fn attach_device(
     }
 
     if attached {
-        log::info(&format!("attach success: id={id} auto={auto}"));
+        log::info(&format!(
+            "attach success: id={id} auto={auto} force={force}"
+        ));
         if auto {
+            if force {
+                // 强制附加成功说明旧守护进程未能完成重连，先停掉它，
+                // 再以当前设备状态启动新的 auto-attach 守护进程。
+                if let Ok(mut dm) = daemons.lock() {
+                    log::info(&format!("attach: replacing auto-attach daemon for id={id}"));
+                    dm.stop_matching(&id);
+                }
+            }
             // Keep usbipd watching for replugs.
             let mut args = vec![
                 "attach",
