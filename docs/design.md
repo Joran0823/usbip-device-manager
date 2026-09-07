@@ -34,7 +34,7 @@ USB 设备绑定（bind）并附加（attach）到 WSL 2。
 | `image` | 加载/缩放托盘与窗口图标 |
 | `serde` / `serde_json` | `config.json` 与 `usbipd state` JSON 解析 |
 | `winreg` | 注册表 Uninstall 键查找 usbipd-win 安装信息 |
-| `windows-sys` 0.61 | SetupAPI、ShellExecuteEx、注册表、网卡、locale 等 Win32 API |
+| `windows-sys` 0.61 | ShellExecuteEx、注册表、网卡、locale、WM_DEVICECHANGE 广播等 Win32 API |
 | `embed-resource`（build） | 把 `appicon.ico` 嵌入可执行文件资源 |
 
 仅支持 Windows 10+；Rust edition 2024。无 .NET / PowerShell 依赖。
@@ -48,8 +48,8 @@ src/
   ui.rs        egui 渲染：页面/列表/右键菜单/信息区/设置/弹窗/toast
   usbipd.rs    usbipd-win 检测、usbipd state JSON 解析、绑定/附加/守护进程
   config.rs    配置结构（PascalCase JSON，兼容原 C# 程序）
-  sys.rs       Win32 封装：提权、注册表、网卡、SetupAPI 枚举、单实例、locale
-  monitor.rs   USB 插拔轮询监控线程
+  sys.rs       Win32 封装：提权、注册表、网卡、单实例、locale
+  monitor.rs   USB 插拔广播监听（仅触发，不识别设备）
   lang.rs      中英文文案表与当前语言状态
   theme.rs     深/亮主题
   log.rs       文件日志
@@ -65,8 +65,8 @@ assets/
 | `app.rs` | `App` 状态；`UiMsg` 消息处理；`Action` 分发；后台线程调度；托盘构建 |
 | `ui.rs` | 每帧渲染；页面布局与各区域独立滚动；右键菜单；弹窗与 toast |
 | `usbipd.rs` | `Usbipd::check()`、`list_devices()`（JSON）、bind/unbind/attach/detach、`DaemonManager` |
-| `sys.rs` | `run_elevated`、`find_installed_app`、`network_cards`、`usb_hardware_ids`、单实例、locale |
-| `monitor.rs` | 250ms 轮询 SetupAPI 枚举，diff 后发出插/拔事件 |
+| `sys.rs` | `run_elevated`、`find_installed_app`、`network_cards`、单实例、locale |
+| `monitor.rs` | 隐藏窗口注册设备通知，200ms 合并后发出“状态需检查”信号（不识别设备） |
 | `config.rs` | `SystemConfig`/`AppConfig`/`UsbDevice` 与读写、路径 |
 | `theme.rs` | 深/亮两套 `Visuals`/`Style` 与主题感知取色 |
 | `lang.rs` | 文案 key → 中/英文；`lang::t()`；启动时语言检测 |
@@ -82,7 +82,7 @@ assets/
    是否以 `zh` 开头）决定初始语言。
 4. 创建 eframe 窗口（标题栏图标 = 托盘图标），启动：
    - `usbipd-check` 线程：`Usbipd::check()` 检测安装与版本；
-   - `UsbMonitor`：开始 250ms 的 USB 枚举轮询；
+   - `UsbMonitor`：隐藏窗口注册设备通知，接收 USB 广播（仅作触发信号）；
    - 托盘图标与菜单事件线程。
 5. 收到 `UiMsg::UsbipdReady` 后进入就绪状态并触发首次列表刷新。
 6. 退出：点击 Exit / 关闭窗口（关闭到托盘时改为隐藏）；`App::drop` 停止
@@ -271,25 +271,34 @@ usbipd.exe state
 
 ## 8. USB 热插拔监控
 
-`monitor.rs` + `sys::usb_hardware_ids()` 组成轮询式监控：
+原则：**Windows 广播只当“敲门砖”，设备增删一律以 `usbipd state` 快照
+差集为准**。Windows 的 PnP 通知在附加/导出时会产生节点增删、影子设备
+互换（如 `VID_0403` ↔ `VID_80EE`）和密集的 0x7 广播，无法可靠反推
+“物理插拔”；而 `usbipd state` 与界面展示同源，天然不会误判。
 
-1. 每 250ms 用 SetupAPI（class=USB、DIGCF_PRESENT|ALLCLASSES）枚举当前
-   USB 设备 InstanceId，提取大写 `VID:PID` 集合（排序去重）；
-2. 与上一轮集合求差：新增 → `connected=true`，消失 → `connected=false`，
-   通过 `UiMsg::UsbChanged` 上报并 `request_repaint`；
-3. UI 帧内 `queue_usb_change` 先合并事件：忙/正在列表时不处理；距上次
-   刷新不足 900ms 视为系统仍在枚举，继续合并等待；
-4. 冷却结束后由 `usb-event` 线程执行一次 `list_devices()`，刷新三页数据，
-   并对变化设备发状态 toast；`maybe_auto_attach` 随后自动附加匹配设备。
+1. `monitor.rs` 用隐藏顶层窗口注册设备通知，收到 `WM_DEVICECHANGE`
+   （0x8000/0x8004/0x7）后只做 200ms 合并去抖，然后发 `UiMsg::UsbActivity`
+   ——不枚举、不携带任何设备身份；
+2. UI 帧内 `flush_usb_activity`：900ms 风暴冷却后由 `refresh` 线程执行
+   一次 `list_devices()`，与上一份快照比较；
+3. 快照无变化 → 不重建列表、不重绘（消除附加成功后的“一直在刷新”）；
+4. 快照有变化 → 重建三页数据并重绘；消失的设备若上一帧处于 attached，
+   按其 busid/VID:PID 停止对应自动附加守护进程；新增设备由
+   `maybe_auto_attach` 触发自动附加（8 秒防抖到期后自动补一次评估）；
+5. 由于 `usbipd state` 相对广播有短暂滞后，广播触发后若快照无变化会
+   自动补查（600ms × 至多 2 次）；
+6. 界面空闲时没有任何周期性任务：插拔（包括附加到 WSL 的设备拔出时伴随
+   的导出/影子节点变化）都会产生 `WM_DEVICECHANGE` 广播，触发一次 state
+   检查；
+7. auto 设备插入后若未附加，`watch_auto_attach` 会做 **200ms × 3 轮**的
+   静默兜底：每轮查询一次 `usbipd state`，未附加则执行一次 `usbipd
+   attach`（无视 8 秒防抖，不占用 busy/spinner），已附加即停止；
+   `--auto-attach` 守护进程“活着但设备未附加”会被视为卡死并先停掉，
+   避免被误判为“附加中”而阻塞重试。3 轮用完后等下一次状态变化再武装。
 
-曾经的“插入约 7 秒后才显示”主要是两个因素叠加：
-
-- Windows 对复合/多接口设备是逐个枚举的，事件在数秒内高频出现；
-- 旧实现每次事件都冷启动 PowerShell（约 276ms/次），事件风暴造成连续
-  启动多个 PowerShell 并互相竞争。
-
-现方案合并去抖 + 单次原生 `usbipd state`（约 60ms/次）后，插拔只触发
-一次刷新，延迟明显下降。
+曾经的“插入约 7 秒后才显示”主要是旧实现每次事件都冷启动 PowerShell
+（约 276ms/次），事件风暴造成连续启动多个 PowerShell 并互相竞争；
+改为去抖 + 单次原生 `usbipd state` 后延迟明显下降。
 
 ## 9. 线程模型与消息机制
 
@@ -298,12 +307,12 @@ egui 是单线程渲染模型，所有耗时工作放在后台线程，结果经
 
 | 线程 | 职责 | 触发 |
 | --- | --- | --- |
-| UI 主线程（`logic`/`ui`） | 渲染、收消息、flush USB 事件、分发 Action | 常驻 |
+| UI 主线程（`logic`/`ui`） | 渲染、收消息、flush USB 活动、auto 附加兜底观察、分发 Action | 常驻 |
 | `usbipd-check` | 检测安装/版本 | App 启动一次 |
 | `refresh` | `list_devices()` 刷新 | 手动刷新/切页/初始化 |
 | `usbipd-op` | bind/unbind/attach/detach 等一次操作 | 每次用户操作 |
-| `usb-event` | 插拔冷却后的列表刷新 | 每次合并后的插拔事件 |
-| `usb-monitor` | 250ms SetupAPI 轮询 | App 生命周期内 |
+| `usbipd-state-poll` | auto 附加兜底：200ms × 3 轮静默查询 | auto 设备未附加期间 |
+| `usb-monitor` | 监听 WM_DEVICECHANGE 广播（200ms 合并） | App 生命周期内 |
 | `tray-menu` | 托盘菜单事件 | 托盘存在期间 |
 
 核心消息（`UiMsg`）：
@@ -311,12 +320,11 @@ egui 是单线程渲染模型，所有耗时工作放在后台线程，结果经
 | 消息 | 含义与处理 |
 | --- | --- |
 | `UsbipdReady` | usbipd 检查完成：置就绪、触发首次刷新 |
-| `Lists(Vec<UsbDevice>)` | 刷新结果：重建三页数据、恢复选中、自动附加 |
-| `UsbListFinished` | 列表任务结束：清 busy |
+| `Lists(Vec<UsbDevice>)` | state 快照：差集决策（停守护/自动附加/toast），有变化才重建 |
+| `ListFailed` | state 获取失败：提示但不清空列表 |
 | `OpDone` | 操作结果：toast/错误弹窗，然后刷新 |
 | `Error` | 错误：写日志 + 弹窗 |
-| `UsbChanged` | 插拔事件：合并去抖 |
-| `UsbNotify` | 插拔后设备状态 toast |
+| `UsbActivity` | USB 广播信号：合并后触发一次 state 查询 |
 | `ShowWindow` / `ExitApp` | 托盘控制 |
 
 忙状态通过 `busy` 标志串联：操作中继续点刷新只置 `need_refresh`，
@@ -354,8 +362,8 @@ cargo build --release
 
 - bind/unbind 依赖 UAC/EPM 放行（见 7.3）；后续可加“进程已提权则直跑
   usbipd”检测；
-- USB 监控为 250ms 轮询而非事件驱动；可改用 SetupAPI 注册设备通知以
-  消除轮询间隔，成本低、收益有限；
+- USB 插拔依赖广播触发：若个别环境对“附加到 WSL 的设备拔出”完全不产生
+  Windows 广播，列表需手动刷新才会更新；
 - 单实例、单 usbipd 工作流是刻意取舍，避免并发命令互相干扰；
 - 配置目录继续使用 `WSL USB Manager` 名称以兼容旧版，换新名会丢配置；
 - 若未来需要兼容 4.4.0 之前的 usbipd（无 `state` JSON），可保留

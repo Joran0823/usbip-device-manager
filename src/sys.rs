@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Windows-specific helpers: elevated process, registry lookup, adapters,
-//! USB device enumeration, locale and process helpers.
+//! locale and process helpers.
 
 use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
@@ -423,73 +423,4 @@ pub fn network_cards() -> Vec<(String, String)> {
     }
     result.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     result
-}
-
-// ---------------------------------------------------------------------------
-// USB device enumeration (SetupAPI)
-// ---------------------------------------------------------------------------
-
-/// Enumerate present USB PnP devices and return their `VID:PID` hardware ids
-/// (uppercase), which is what the old WMI monitor produced.
-pub fn usb_hardware_ids() -> Vec<String> {
-    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-        DIGCF_ALLCLASSES, DIGCF_PRESENT, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
-        SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
-    };
-
-    let mut ids = Vec::new();
-    unsafe {
-        let usb = to_wide("USB");
-        let set = SetupDiGetClassDevsW(
-            ptr::null(),
-            usb.as_ptr(),
-            ptr::null_mut(),
-            DIGCF_PRESENT | DIGCF_ALLCLASSES,
-        );
-        if set == 0 {
-            return ids;
-        }
-        let mut idx: u32 = 0;
-        loop {
-            let mut data: SP_DEVINFO_DATA = std::mem::zeroed();
-            data.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
-            if SetupDiEnumDeviceInfo(set, idx, &mut data) == 0 {
-                break;
-            }
-            idx += 1;
-
-            let mut required: u32 = 0;
-            SetupDiGetDeviceInstanceIdW(set, &data, ptr::null_mut(), 0, &mut required);
-            if required == 0 {
-                continue;
-            }
-            let mut buf = vec![0u16; required as usize + 2];
-            if SetupDiGetDeviceInstanceIdW(
-                set,
-                &data,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-                &mut required,
-            ) != 0
-            {
-                let id = from_wide(buf.as_ptr());
-                if let Some(hwid) = vid_pid_of(&id) {
-                    ids.push(hwid);
-                }
-            }
-        }
-        SetupDiDestroyDeviceInfoList(set);
-    }
-    ids.sort();
-    ids.dedup();
-    ids
-}
-
-fn vid_pid_of(instance_id: &str) -> Option<String> {
-    let upper = instance_id.to_ascii_uppercase();
-    let vid_start = upper.find("VID_")? + 4;
-    let vid = upper.get(vid_start..vid_start + 4)?;
-    let pid_pos = upper[vid_start + 4..].find("PID_")? + vid_start + 4;
-    let pid = upper.get(pid_pos..pid_pos + 4)?;
-    Some(format!("{vid}:{pid}"))
 }
