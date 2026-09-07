@@ -832,9 +832,27 @@ impl App {
             change.instance_id, change.connected
         ));
         if !change.connected {
-            // 拔出设备即结束其 auto-attach 守护进程；重插后由
-            // maybe_auto_attach 重新附加并启动新守护（避免旧守护进程
-            // 绑定过期的 busid/处于失效状态时压制后续附加）。
+            // 设备附加到 WSL 后 Windows 侧设备节点会消失，SetupAPI 会把它
+            // 误报为“拔出”。这种事件是导出副作用，不是真正的物理拔出：
+            // 若设备仍处于已附加/附加中状态，直接忽略，避免杀掉守护进程
+            // 导致“附加→误判拔出→杀守护→重连”死循环。
+            let row = self
+                .device_rows
+                .iter()
+                .find(|r| r.dev.instance_id.eq_ignore_ascii_case(&change.instance_id));
+            let attached = row.is_some_and(|r| r.dev.is_attached);
+            let recent = row
+                .and_then(|r| self.pending_attach.get(&r.dev.hardware_id))
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(15));
+            if attached || recent || self.busy {
+                log::info(&format!(
+                    "USB unplug while attached/busy ignored (export artifact): instance={}",
+                    change.instance_id
+                ));
+                return;
+            }
+            // 真正的物理拔出：结束 auto-attach 守护进程；重插后由
+            // maybe_auto_attach 重新附加并启动新守护。
             self.stop_daemon_for_unplug(&change.instance_id);
         }
         self.pending_usb = Some(change);
@@ -926,10 +944,13 @@ impl App {
                     ));
                     // SetupAPI 刚报告拔出时，usbipd state 可能仍短暂残留该设备；
                     // 此时只发一次事件的刷新会把旧状态留在列表里，需要稍后复核一次。
+                    // 只对“未附加却仍残留”的拔出结果复核；已附加的设备在
+                    // usbipd state 中保持连接是正常的（导出状态），不再补查。
                     let stale = !change.connected
                         && list.iter().any(|d| {
                             d.instance_id.eq_ignore_ascii_case(&change.instance_id)
                                 && d.is_connected
+                                && !d.is_attached
                         });
                     let notify = list
                         .iter()

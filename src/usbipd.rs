@@ -615,6 +615,10 @@ IsAttached : False
 
 pub struct DaemonManager {
     children: Vec<DaemonProc>,
+    /// Job Object（KILL_ON_JOB_CLOSE）：本进程无论正常退出还是被强杀，
+    /// 都会连带终止自动附加守护进程，避免遗留占着设备的孤儿进程。
+    #[cfg(windows)]
+    job: Option<usize>,
 }
 
 struct DaemonProc {
@@ -626,6 +630,8 @@ impl DaemonManager {
     pub fn new() -> Self {
         Self {
             children: Vec::new(),
+            #[cfg(windows)]
+            job: create_kill_on_close_job(),
         }
     }
 
@@ -679,6 +685,34 @@ impl DaemonManager {
         let child = command
             .spawn()
             .map_err(|e| format!("Failed to start auto-attach daemon: {e}"))?;
+        #[cfg(windows)]
+        if let Some(job) = self.job {
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+            use windows_sys::Win32::System::Threading::OpenProcess;
+            const PROCESS_SET_QUOTA: u32 = 0x0100;
+            const PROCESS_TERMINATE: u32 = 0x0001;
+            unsafe {
+                let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, child.id());
+                if proc.is_null() {
+                    log::info(&format!(
+                        "auto-attach daemon exited before job assignment (pid={})",
+                        child.id()
+                    ));
+                } else {
+                    let ok = windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+                        job as HANDLE,
+                        proc,
+                    );
+                    CloseHandle(proc);
+                    if ok == 0 {
+                        log::warn(&format!(
+                            "failed to assign auto-attach daemon to job object (pid={})",
+                            child.id()
+                        ));
+                    }
+                }
+            }
+        }
         log::info(&format!(
             "auto-attach daemon started: pid={} args={}",
             child.id(),
@@ -716,6 +750,49 @@ impl DaemonManager {
             let _ = sys::kill_pid(pid);
         }
         self.children.clear();
+    }
+}
+
+#[cfg(windows)]
+fn create_kill_on_close_job() -> Option<usize> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 {
+            CloseHandle(job);
+            return None;
+        }
+        Some(job as usize)
+    }
+}
+
+impl Drop for DaemonManager {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(job) = self.job {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(
+                    job as windows_sys::Win32::Foundation::HANDLE,
+                );
+            }
+        }
     }
 }
 
@@ -853,6 +930,16 @@ pub fn unbind_device(
     }
 }
 
+/// 重插后设备尚未就绪/被占用等可自动恢复的错误：等待后重试即可，
+/// 不应立即判定失败。
+fn is_transient_attach_error(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("device busy")
+        || s.contains("used by windows")
+        || s.contains("device not found")
+        || s.contains("not found")
+}
+
 fn translate_attach_error(raw: &str) -> String {
     if lang::is_zh() {
         if raw.contains("A firewall appears to be blocking the connection") {
@@ -922,15 +1009,45 @@ pub fn attach_device(
     log::info(&format!(
         "attach daemon in progress for id={id}: {in_progress}"
     ));
+    let mut attached = false;
+    let mut last_err: Option<String> = None;
+
     if !in_progress {
-        let out = usbipd.attach(&id, use_bus_id, host_ip)?;
-        if out.code != ErrCode::Success {
-            return Err(translate_attach_error(&out.stderr));
+        let mut out = usbipd.attach(&id, use_bus_id, host_ip)?;
+        let mut attempt = 0;
+        while out.code != ErrCode::Success && attempt < 5 {
+            if !is_transient_attach_error(&out.stderr) {
+                return Err(translate_attach_error(&out.stderr));
+            }
+            attempt += 1;
+            last_err = Some(out.stderr.clone());
+            log::info(&format!(
+                "attach transient failure (attempt {attempt}): id={id} stderr={}",
+                out.stderr.trim()
+            ));
+            std::thread::sleep(Duration::from_millis(1000));
+            // 重试前先看设备是否其实已经被附加（例如旧守护进程已完成）。
+            if let Ok(list) = usbipd.list_devices() {
+                if find_device(&list, &cur.hardware_id).is_some_and(|u| u.is_attached) {
+                    attached = true;
+                    break;
+                }
+            }
+            out = usbipd.attach(&id, use_bus_id, host_ip)?;
+        }
+        if !attached && out.code != ErrCode::Success {
+            if is_transient_attach_error(&out.stderr) {
+                last_err = Some(out.stderr.clone());
+            } else {
+                return Err(translate_attach_error(&out.stderr));
+            }
         }
     }
 
-    let mut attached = false;
     for i in 1..=10 {
+        if attached {
+            break;
+        }
         match usbipd.list_devices() {
             Ok(list) => {
                 if let Some(u) = find_device(&list, &cur.hardware_id) {
@@ -948,15 +1065,17 @@ pub fn attach_device(
             }
             Err(e) => log::warn(&format!("attach poll {i}: list_devices failed: {e}")),
         }
-        if !in_progress && i % 3 == 0 {
+        if !in_progress && (last_err.is_some() || i % 3 == 0) {
             log::info(&format!(
                 "attach retry {i}: launching usbipd attach for id={id}"
             ));
             let out = usbipd.attach(&id, use_bus_id, host_ip)?;
             if out.code != ErrCode::Success {
-                let e = translate_attach_error(&out.stderr);
-                log::error(&format!("attach retry {i} failed: {e}"));
-                return Err(e);
+                log::info(&format!(
+                    "attach retry {i} still failing: id={id} stderr={}",
+                    out.stderr.trim()
+                ));
+                last_err = Some(out.stderr.clone());
             }
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -993,7 +1112,12 @@ pub fn attach_device(
         }
         Ok(lang::t("AutoAttachDaemonExit"))
     } else {
-        let e = translate_attach_error(&lang::t("ErrMsgAttachFail"));
+        let detail = last_err.unwrap_or_default();
+        let e = if detail.is_empty() {
+            translate_attach_error(&lang::t("ErrMsgAttachFail"))
+        } else {
+            translate_attach_error(&detail)
+        };
         log::error(&format!(
             "attach failed after polls: id={id} auto={auto} in_progress={in_progress} error={e}"
         ));

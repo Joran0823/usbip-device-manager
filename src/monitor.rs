@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 //! Detects USB plug/unplug through `RegisterDeviceNotification`
-//! (`WM_DEVICECHANGE`) on a hidden message-only window. The thread blocks
-//! in `GetMessageW` and only enumerates devices after a system notification,
-//! so there is no periodic polling.
+//! (`WM_DEVICECHANGE`) on a hidden top-level window. The thread blocks in
+//! `GetMessageW`; device notifications are synchronous `SendMessage` calls,
+//! so they are handled directly in the window procedure, which triggers an
+//! enumeration diff. There is no periodic polling.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,8 +21,9 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE, DBT_DEVTYP_DEVICEINTERFACE,
     DEV_BROADCAST_DEVICEINTERFACE_W, DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GetMessageW, PostThreadMessageW, RegisterClassW, RegisterDeviceNotificationW,
-    TranslateMessage, UnregisterDeviceNotification, WM_DEVICECHANGE, WM_QUIT, WNDCLASSW, WS_POPUP,
+    DispatchMessageW, GetMessageW, KillTimer, PostThreadMessageW, RegisterClassW,
+    RegisterDeviceNotificationW, SetTimer, TranslateMessage, UnregisterDeviceNotification,
+    WM_DEVICECHANGE, WM_QUIT, WM_TIMER, WNDCLASSW, WS_POPUP,
 };
 use windows_sys::core::{GUID, PCWSTR};
 
@@ -33,16 +36,29 @@ pub struct UsbChange {
     pub connected: bool,
 }
 
+/// 窗口过程与消息循环运行在同一线程。这里保存“上次快照 + 回调”，
+/// 让 wnd_proc 收到 WM_DEVICECHANGE 时能直接触发枚举差集。
+struct MonitorCtx {
+    previous: HashSet<String>,
+    cb: Box<dyn Fn(UsbChange) + Send>,
+}
+
+thread_local! {
+    static CTX: RefCell<Option<MonitorCtx>> = const { RefCell::new(None) };
+}
+
 const WINDOW_CLASS: &str = "usbipdm-usb-notify";
 
 /// dbcc_classguid = GUID_NULL：注册“所有设备接口类”的通知，
-/// 由调用方在收到事件后枚举过滤（比只注册 USB_DEVICE 接口类更可靠）。
+/// 由调用方在收到事件后枚举过滤。
 const ALL_CLASSES_GUID: GUID = GUID {
     data1: 0,
     data2: 0,
     data3: 0,
     data4: [0; 8],
 };
+
+const RECHECK_TIMER_ID: usize = 1;
 
 pub struct UsbMonitor {
     handle: Option<JoinHandle<()>>,
@@ -98,6 +114,41 @@ impl Drop for UsbMonitor {
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
+    if msg == WM_DEVICECHANGE {
+        log::info(&format!(
+            "WM_DEVICECHANGE (sent) wparam=0x{:X}",
+            wparam as u32
+        ));
+        let w = wparam as u32;
+        if w == DBT_DEVICEARRIVAL || w == DBT_DEVICEREMOVECOMPLETE {
+            // 设备通知是同步 SendMessage，直接在窗口过程里做枚举差集；
+            // SetupAPI 通常比通知晚几百毫秒更新，故再挂一个 400ms 定时器补查。
+            CTX.with(|ctx| {
+                if let Ok(mut guard) = ctx.try_borrow_mut() {
+                    if let Some(c) = guard.as_mut() {
+                        emit_diff(&mut c.previous, &*c.cb);
+                    }
+                }
+            });
+            unsafe {
+                let _ = SetTimer(hwnd, RECHECK_TIMER_ID, 400, None);
+            }
+            return 1;
+        }
+    }
+    if msg == WM_TIMER && wparam == RECHECK_TIMER_ID {
+        unsafe {
+            let _ = KillTimer(hwnd, RECHECK_TIMER_ID);
+        }
+        CTX.with(|ctx| {
+            if let Ok(mut guard) = ctx.try_borrow_mut() {
+                if let Some(c) = guard.as_mut() {
+                    emit_diff(&mut c.previous, &*c.cb);
+                }
+            }
+        });
+        return 0;
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -105,10 +156,7 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn emit_diff<F>(previous: &mut HashSet<String>, cb: &F)
-where
-    F: Fn(UsbChange),
-{
+fn emit_diff(previous: &mut HashSet<String>, cb: &dyn Fn(UsbChange)) {
     let current: HashSet<String> = sys::usb_instance_ids().into_iter().collect();
     for id in current.difference(previous) {
         log::info(&format!("USB device plugged: {id}"));
@@ -147,8 +195,7 @@ where
             return;
         }
 
-        // 使用隐藏的普通顶层窗口（而非 message-only 窗口）接收设备通知，
-        // 避免部分 Windows 版本不向 message-only 窗口投递 WM_DEVICECHANGE。
+        // 隐藏的普通顶层窗口（而非 message-only 窗口）接收设备通知。
         let hwnd = CreateWindowExW(
             0,
             class_ptr,
@@ -168,6 +215,13 @@ where
             return;
         }
 
+        CTX.with(|ctx| {
+            *ctx.borrow_mut() = Some(MonitorCtx {
+                previous: sys::usb_instance_ids().into_iter().collect(),
+                cb: Box::new(cb),
+            });
+        });
+
         let mut filter: DEV_BROADCAST_DEVICEINTERFACE_W = std::mem::zeroed();
         filter.dbcc_size = size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>() as u32;
         filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
@@ -179,6 +233,8 @@ where
         );
         if notify.is_null() {
             log::warn("RegisterDeviceNotification failed; USB events will not be received");
+        } else {
+            log::info("device notifications registered");
         }
 
         if let Ok(mut tid) = thread_id.lock() {
@@ -186,9 +242,7 @@ where
         }
         log::info("USB notification window ready (event-driven)");
 
-        let mut previous: HashSet<String> = sys::usb_instance_ids().into_iter().collect();
         let mut msg: windows_sys::Win32::UI::WindowsAndMessaging::MSG = std::mem::zeroed();
-
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -196,19 +250,6 @@ where
             let r = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
             if r <= 0 {
                 break;
-            }
-            if msg.message == WM_DEVICECHANGE {
-                let wparam = msg.wParam as u32;
-                if wparam == DBT_DEVICEARRIVAL || wparam == DBT_DEVICEREMOVECOMPLETE {
-                    log::info(&format!(
-                        "USB device notification received: wparam=0x{wparam:X}"
-                    ));
-                    emit_diff(&mut previous, &cb);
-                    // 系统通知到达时设备列表可能尚未更新，400ms 后补查一次。
-                    std::thread::sleep(Duration::from_millis(400));
-                    emit_diff(&mut previous, &cb);
-                }
-                continue;
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
