@@ -429,9 +429,11 @@ pub fn network_cards() -> Vec<(String, String)> {
 // USB device enumeration (SetupAPI)
 // ---------------------------------------------------------------------------
 
-/// Enumerate present USB PnP devices and return their `VID:PID` hardware ids
-/// (uppercase), which is what the old WMI monitor produced.
-pub fn usb_hardware_ids() -> Vec<String> {
+/// Enumerate present USB PnP device nodes and return their full Windows
+/// device instance ids (e.g. `USB\VID_0403&PID_6001\A50285BI`). The instance
+/// id uniquely identifies a device instance and matches the `InstanceId`
+/// reported by `usbipd state`.
+pub fn usb_instance_ids() -> Vec<String> {
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
         DIGCF_ALLCLASSES, DIGCF_PRESENT, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
         SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
@@ -473,8 +475,8 @@ pub fn usb_hardware_ids() -> Vec<String> {
             ) != 0
             {
                 let id = from_wide(buf.as_ptr());
-                if let Some(hwid) = vid_pid_of(&id) {
-                    ids.push(hwid);
+                if !id.trim().is_empty() {
+                    ids.push(id);
                 }
             }
         }
@@ -483,13 +485,4 @@ pub fn usb_hardware_ids() -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
-}
-
-fn vid_pid_of(instance_id: &str) -> Option<String> {
-    let upper = instance_id.to_ascii_uppercase();
-    let vid_start = upper.find("VID_")? + 4;
-    let vid = upper.get(vid_start..vid_start + 4)?;
-    let pid_pos = upper[vid_start + 4..].find("PID_")? + vid_start + 4;
-    let pid = upper.get(pid_pos..pid_pos + 4)?;
-    Some(format!("{vid}:{pid}"))
 }

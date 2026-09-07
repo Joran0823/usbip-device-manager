@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Joran
 // SPDX-License-Identifier: MIT
 
-//! Detects USB plug/unplug by polling SetupAPI and emits `VID:PID` changes.
+//! Detects USB plug/unplug by polling SetupAPI and emits device instance id
+//! changes.
 
 use std::collections::HashSet;
 use std::thread::JoinHandle;
@@ -12,7 +13,7 @@ use crate::sys;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsbChange {
-    pub hardware_id: String,
+    pub instance_id: String,
     pub connected: bool,
 }
 
@@ -31,21 +32,21 @@ impl UsbMonitor {
         let handle = std::thread::Builder::new()
             .name("usb-monitor".to_owned())
             .spawn(move || {
-                let mut previous: HashSet<String> = sys::usb_hardware_ids().into_iter().collect();
+                let mut previous: HashSet<String> = sys::usb_instance_ids().into_iter().collect();
                 while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(250));
-                    let current: HashSet<String> = sys::usb_hardware_ids().into_iter().collect();
+                    let current: HashSet<String> = sys::usb_instance_ids().into_iter().collect();
                     for id in current.difference(&previous) {
                         log::info(&format!("USB device plugged: {id}"));
                         cb(UsbChange {
-                            hardware_id: id.clone(),
+                            instance_id: id.clone(),
                             connected: true,
                         });
                     }
                     for id in previous.difference(&current) {
                         log::info(&format!("USB device unplugged: {id}"));
                         cb(UsbChange {
-                            hardware_id: id.clone(),
+                            instance_id: id.clone(),
                             connected: false,
                         });
                     }

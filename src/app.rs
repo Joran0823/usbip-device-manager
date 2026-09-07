@@ -828,33 +828,41 @@ impl App {
     /// 避免复合设备枚举时连续多次调用 usbipd state。
     pub fn queue_usb_change(&mut self, change: UsbChange, ctx: &egui::Context) {
         log::info(&format!(
-            "USB change queued: {} connected={}",
-            change.hardware_id, change.connected
+            "USB change queued: instance={} connected={}",
+            change.instance_id, change.connected
         ));
         if !change.connected {
             // 拔出设备即结束其 auto-attach 守护进程；重插后由
             // maybe_auto_attach 重新附加并启动新守护（避免旧守护进程
             // 绑定过期的 busid/处于失效状态时压制后续附加）。
-            self.stop_auto_daemon_of(&change.hardware_id);
+            self.stop_daemon_for_unplug(&change.instance_id);
         }
         self.pending_usb = Some(change);
         ctx.request_repaint_after(Duration::from_millis(120));
     }
 
-    /// 停止与某个设备相关的 auto-attach 守护进程。默认按 hardware id
-    /// 匹配；开启 UseBusID 时额外按当前设备行的 bus id 匹配。
-    fn stop_auto_daemon_of(&mut self, hardware_id: &str) {
-        let mut needles = vec![hardware_id.to_owned()];
-        if self.cfg.app_config.use_bus_id {
-            if let Some(row) = self
-                .device_rows
-                .iter()
-                .find(|r| r.dev.hardware_id.eq_ignore_ascii_case(hardware_id))
-            {
-                if !row.dev.bus_id.is_empty() {
-                    needles.push(row.dev.bus_id.clone());
-                }
+    /// 拔出事件携带的 InstanceId 与 usbipd state 的 InstanceId 同源。
+    /// 先在当前列表行里按 InstanceId 定位设备，再取出其 hardware_id /
+    /// bus_id 停止对应守护进程（守护进程参数可能使用其中任意一种）。
+    fn stop_daemon_for_unplug(&mut self, instance_id: &str) {
+        let mut needles: Vec<String> = Vec::new();
+        for row in &self.device_rows {
+            if !row.dev.instance_id.eq_ignore_ascii_case(instance_id) {
+                continue;
             }
+            if !row.dev.bus_id.is_empty() {
+                needles.push(row.dev.bus_id.clone());
+            }
+            if !row.dev.hardware_id.is_empty() {
+                needles.push(row.dev.hardware_id.clone());
+            }
+        }
+        if needles.is_empty() {
+            log::warn(&format!(
+                "USB unplug {}: no matching list row, daemon not stopped",
+                instance_id
+            ));
+            return;
         }
         if let Ok(mut dm) = self.daemons.lock() {
             for needle in needles {
@@ -881,16 +889,16 @@ impl App {
             .is_some_and(|t| t.elapsed() < Duration::from_millis(900))
         {
             log::info(&format!(
-                "USB change deferred (cooldown): {} connected={}",
-                change.hardware_id, change.connected
+                "USB change deferred (cooldown): instance={} connected={}",
+                change.instance_id, change.connected
             ));
             self.pending_usb = Some(change);
             ctx.request_repaint_after(Duration::from_millis(150));
             return;
         }
         log::info(&format!(
-            "USB change processing: {} connected={}",
-            change.hardware_id, change.connected
+            "USB change processing: instance={} connected={}",
+            change.instance_id, change.connected
         ));
         self.last_usb_refresh = Some(Instant::now());
         self.usb_listing = true;
@@ -910,8 +918,8 @@ impl App {
             .spawn(move || match client.list_devices() {
                 Ok(list) => {
                     log::info(&format!(
-                        "USB change {} (connected={}) -> refreshed {} device(s) in {} ms",
-                        change.hardware_id,
+                        "USB change instance={} (connected={}) -> refreshed {} device(s) in {} ms",
+                        change.instance_id,
                         change.connected,
                         list.len(),
                         started.elapsed().as_millis()
@@ -920,12 +928,12 @@ impl App {
                     // 此时只发一次事件的刷新会把旧状态留在列表里，需要稍后复核一次。
                     let stale = !change.connected
                         && list.iter().any(|d| {
-                            d.hardware_id.eq_ignore_ascii_case(&change.hardware_id)
+                            d.instance_id.eq_ignore_ascii_case(&change.instance_id)
                                 && d.is_connected
                         });
                     let notify = list
                         .iter()
-                        .find(|d| d.hardware_id.eq_ignore_ascii_case(&change.hardware_id))
+                        .find(|d| d.instance_id.eq_ignore_ascii_case(&change.instance_id))
                         .map(|d| {
                             let status = if d.is_connected {
                                 if d.is_attached {
@@ -944,8 +952,8 @@ impl App {
                     egui_ctx.request_repaint();
                     if stale {
                         log::info(&format!(
-                            "USB unplug {}: state still shows the device, rechecking in 1.5 s",
-                            change.hardware_id
+                            "USB unplug instance={}: state still shows the device, rechecking in 1.5 s",
+                            change.instance_id
                         ));
                         std::thread::sleep(Duration::from_millis(1500));
                         let _ = tx.send(UiMsg::UsbChanged(change));
