@@ -19,9 +19,8 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE, DBT_DEVTYP_DEVICEINTERFACE,
     DEV_BROADCAST_DEVICEINTERFACE_W, DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GetMessageW, HWND_MESSAGE, PostThreadMessageW, RegisterClassW,
-    RegisterDeviceNotificationW, TranslateMessage, UnregisterDeviceNotification, WM_DEVICECHANGE,
-    WM_QUIT, WNDCLASSW,
+    DispatchMessageW, GetMessageW, PostThreadMessageW, RegisterClassW, RegisterDeviceNotificationW,
+    TranslateMessage, UnregisterDeviceNotification, WM_DEVICECHANGE, WM_QUIT, WNDCLASSW, WS_POPUP,
 };
 use windows_sys::core::{GUID, PCWSTR};
 
@@ -36,13 +35,13 @@ pub struct UsbChange {
 
 const WINDOW_CLASS: &str = "usbipdm-usb-notify";
 
-/// GUID_DEVINTERFACE_USB_DEVICE:
-/// {A5DCBF10-6530-11D2-901F-00C04FB951ED}
-const USB_DEVICE_CLASS_GUID: GUID = GUID {
-    data1: 0xA5DC_BF10,
-    data2: 0x6530,
-    data3: 0x11D2,
-    data4: [0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED],
+/// dbcc_classguid = GUID_NULL：注册“所有设备接口类”的通知，
+/// 由调用方在收到事件后枚举过滤（比只注册 USB_DEVICE 接口类更可靠）。
+const ALL_CLASSES_GUID: GUID = GUID {
+    data1: 0,
+    data2: 0,
+    data3: 0,
+    data4: [0; 8],
 };
 
 pub struct UsbMonitor {
@@ -148,16 +147,18 @@ where
             return;
         }
 
+        // 使用隐藏的普通顶层窗口（而非 message-only 窗口）接收设备通知，
+        // 避免部分 Windows 版本不向 message-only 窗口投递 WM_DEVICECHANGE。
         let hwnd = CreateWindowExW(
             0,
             class_ptr,
             wide("usbipdm-usb-notify").as_ptr(),
+            WS_POPUP,
             0,
             0,
             0,
             0,
-            0,
-            HWND_MESSAGE,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinstance,
             std::ptr::null(),
@@ -170,7 +171,7 @@ where
         let mut filter: DEV_BROADCAST_DEVICEINTERFACE_W = std::mem::zeroed();
         filter.dbcc_size = size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>() as u32;
         filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-        filter.dbcc_classguid = USB_DEVICE_CLASS_GUID;
+        filter.dbcc_classguid = ALL_CLASSES_GUID;
         let notify = RegisterDeviceNotificationW(
             hwnd,
             &filter as *const _ as *const core::ffi::c_void,
