@@ -831,8 +831,36 @@ impl App {
             "USB change queued: {} connected={}",
             change.hardware_id, change.connected
         ));
+        if !change.connected {
+            // 拔出设备即结束其 auto-attach 守护进程；重插后由
+            // maybe_auto_attach 重新附加并启动新守护（避免旧守护进程
+            // 绑定过期的 busid/处于失效状态时压制后续附加）。
+            self.stop_auto_daemon_of(&change.hardware_id);
+        }
         self.pending_usb = Some(change);
         ctx.request_repaint_after(Duration::from_millis(120));
+    }
+
+    /// 停止与某个设备相关的 auto-attach 守护进程。默认按 hardware id
+    /// 匹配；开启 UseBusID 时额外按当前设备行的 bus id 匹配。
+    fn stop_auto_daemon_of(&mut self, hardware_id: &str) {
+        let mut needles = vec![hardware_id.to_owned()];
+        if self.cfg.app_config.use_bus_id {
+            if let Some(row) = self
+                .device_rows
+                .iter()
+                .find(|r| r.dev.hardware_id.eq_ignore_ascii_case(hardware_id))
+            {
+                if !row.dev.bus_id.is_empty() {
+                    needles.push(row.dev.bus_id.clone());
+                }
+            }
+        }
+        if let Ok(mut dm) = self.daemons.lock() {
+            for needle in needles {
+                dm.stop_matching(&needle);
+            }
+        }
     }
 
     /// 每帧尝试处理合并后的 USB 事件（在 logic 与 ui 中调用）。
