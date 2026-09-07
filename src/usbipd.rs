@@ -974,6 +974,44 @@ fn translate_attach_error(raw: &str) -> String {
     raw.to_owned()
 }
 
+/// 执行一次 `usbipd attach`，并处理 “already attached to a client” 竞态：
+/// 返回该错误时等 50ms 复查 `usbipd state`，若设备确实已附加则返回成功
+/// （不再把这条错误向上抛、触发“无法附加设备”弹窗）。
+fn run_attach_cmd(
+    usbipd: &Usbipd,
+    id: &str,
+    use_bus_id: bool,
+    host_ip: Option<&str>,
+    hardware_id: &str,
+) -> Result<CmdOut, String> {
+    let out = usbipd.attach(id, use_bus_id, host_ip)?;
+    if out.code == ErrCode::Success || !is_already_attached_error(&out.stderr) {
+        return Ok(out);
+    }
+    // usbipd 报告“已附加到客户端”：等 50ms 让状态收敛，再确认一次。
+    std::thread::sleep(Duration::from_millis(50));
+    if !hardware_id.is_empty() {
+        if let Ok(list) = usbipd.list_devices() {
+            if let Some(u) = find_device(&list, hardware_id) {
+                if u.is_attached {
+                    log::info(&format!(
+                        "attach confirmed already attached (50 ms re-check): id={id}"
+                    ));
+                    return Ok(CmdOut {
+                        code: ErrCode::Success,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
+            }
+        }
+    }
+    log::info(&format!(
+        "attach said already attached but state disagrees; will retry: id={id}"
+    ));
+    Ok(out)
+}
+
 pub fn attach_device(
     usbipd: &Usbipd,
     dev: &UsbDevice,
@@ -1047,14 +1085,13 @@ pub fn attach_device(
     let mut last_err: Option<String> = None;
 
     if !in_progress {
-        let mut out = usbipd.attach(&id, use_bus_id, host_ip)?;
+        let mut out = run_attach_cmd(usbipd, &id, use_bus_id, host_ip, &cur.hardware_id)?;
         let mut attempt = 0;
         while out.code != ErrCode::Success && attempt < 5 {
             if is_already_attached_error(&out.stderr) {
-                // 竞态：设备已被守护进程/上一轮附加成功。交由下方 state
-                // 轮询确认，不当作失败弹错误。
+                // 竞态且 50ms 复查未确认：交由下方 state 轮询继续确认。
                 log::info(&format!(
-                    "attach reports already attached (race), verifying via state: id={id}"
+                    "attach still reports already attached, verifying via state: id={id}"
                 ));
                 break;
             }
@@ -1075,7 +1112,7 @@ pub fn attach_device(
                     break;
                 }
             }
-            out = usbipd.attach(&id, use_bus_id, host_ip)?;
+            out = run_attach_cmd(usbipd, &id, use_bus_id, host_ip, &cur.hardware_id)?;
         }
         if !attached && out.code != ErrCode::Success {
             if is_transient_attach_error(&out.stderr) {
@@ -1111,7 +1148,7 @@ pub fn attach_device(
             log::info(&format!(
                 "attach retry {i}: launching usbipd attach for id={id}"
             ));
-            let out = usbipd.attach(&id, use_bus_id, host_ip)?;
+            let out = run_attach_cmd(usbipd, &id, use_bus_id, host_ip, &cur.hardware_id)?;
             if out.code != ErrCode::Success {
                 log::info(&format!(
                     "attach retry {i} still failing: id={id} stderr={}",
