@@ -607,6 +607,17 @@ IsAttached : False
             Some("046d:c534".to_owned())
         );
     }
+
+    #[test]
+    fn recognizes_already_attached_as_success_like_race() {
+        assert!(is_already_attached_error(
+            "Device with busid '6-2' is already attached to a client."
+        ));
+        assert!(is_already_attached_error(
+            "Device with hardware-id '0403:6001' is already attached."
+        ));
+        assert!(!is_already_attached_error("Device not found"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -940,6 +951,14 @@ fn is_transient_attach_error(stderr: &str) -> bool {
         || s.contains("not found")
 }
 
+/// usbipd 提示“设备已附加到某客户端”（例如上一轮 attach 刚成功，或
+/// --auto-attach 守护进程抢先完成）。这是“其实已经附加成功”的信号，
+/// 不是失败：应通过 usbipd state 确认后按成功处理。
+fn is_already_attached_error(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("already attached")
+}
+
 fn translate_attach_error(raw: &str) -> String {
     if lang::is_zh() {
         if raw.contains("A firewall appears to be blocking the connection") {
@@ -1016,6 +1035,14 @@ pub fn attach_device(
         let mut out = usbipd.attach(&id, use_bus_id, host_ip)?;
         let mut attempt = 0;
         while out.code != ErrCode::Success && attempt < 5 {
+            if is_already_attached_error(&out.stderr) {
+                // 竞态：设备已被守护进程/上一轮附加成功。交由下方 state
+                // 轮询确认，不当作失败弹错误。
+                log::info(&format!(
+                    "attach reports already attached (race), verifying via state: id={id}"
+                ));
+                break;
+            }
             if !is_transient_attach_error(&out.stderr) {
                 return Err(translate_attach_error(&out.stderr));
             }
@@ -1038,7 +1065,7 @@ pub fn attach_device(
         if !attached && out.code != ErrCode::Success {
             if is_transient_attach_error(&out.stderr) {
                 last_err = Some(out.stderr.clone());
-            } else {
+            } else if !is_already_attached_error(&out.stderr) {
                 return Err(translate_attach_error(&out.stderr));
             }
         }

@@ -1136,6 +1136,11 @@ impl App {
         if !self.initialized || self.busy {
             return;
         }
+        // 已有刷新排队（例如 attach 成功后的 OpDone 刷新）：快照即将更新，
+        // 避免用旧快照再次附加造成 “already attached” 竞态。
+        if self.need_refresh {
+            return;
+        }
         let now = Instant::now();
         let unattached = |r: &DevRow| r.is_auto && r.dev.is_connected && !r.dev.is_attached;
         if !self.device_rows.iter().any(unattached) {
