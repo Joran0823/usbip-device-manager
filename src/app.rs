@@ -23,8 +23,6 @@ const USB_EVENT_COOLDOWN: Duration = Duration::from_millis(900);
 const USB_RECHECK_INTERVAL: Duration = Duration::from_millis(600);
 /// 单次广播触发后最多自动补查次数（state 相对广播有短暂滞后）。
 const USB_RECHECK_LIMIT: u8 = 2;
-/// 附加过程中的宽限期，期间不因 state 差集停止守护进程。
-const ATTACH_GUARD_WINDOW: Duration = Duration::from_secs(15);
 /// auto 设备插入后未附加时的兜底检查间隔（静默查询 usbipd state）。
 const AUTO_WATCH_INTERVAL: Duration = Duration::from_millis(200);
 /// 兜底检查总轮数：每轮查询一次，未附加则执行一次附加。
@@ -1022,14 +1020,34 @@ impl App {
         let previous = self.state_snapshot.clone().unwrap_or_default();
         if !first {
             let (removed, added) = diff_snapshots(&previous, &devices);
+            // 已绑定设备拔出后，usbipd state 会保留一条“未连接”的记录
+            // （busid 清空、IsConnected=false），而不是删除整条记录。
+            // 因此“attached → 消失或不再 connected”才是物理拔出信号。
+            let unplugged: Vec<&UsbDevice> = previous
+                .iter()
+                .filter(|p| {
+                    if !p.is_attached {
+                        return false;
+                    }
+                    devices
+                        .iter()
+                        .find(|c| c.instance_id.eq_ignore_ascii_case(&p.instance_id))
+                        .map(|c| !c.is_connected)
+                        .unwrap_or(true)
+                })
+                .collect();
             for dev in &removed {
                 log::info(&format!(
                     "usbipd state lost device: instance={} hwid={} was_attached={}",
                     dev.instance_id, dev.hardware_id, dev.is_attached
                 ));
-                if dev.is_attached {
-                    self.stop_daemons_for_removed(dev);
-                }
+            }
+            for dev in &unplugged {
+                log::info(&format!(
+                    "usbipd state: attached device unplugged: instance={} hwid={}",
+                    dev.instance_id, dev.hardware_id
+                ));
+                self.stop_daemons_for_removed(dev);
             }
             for dev in &added {
                 log::info(&format!(
@@ -1037,7 +1055,7 @@ impl App {
                     dev.instance_id, dev.hardware_id
                 ));
             }
-            self.push_change_toasts(&removed, &added);
+            self.push_change_toasts(&unplugged, &added);
         }
         self.usb_rechecks = 0;
         // 状态发生变化 = 新的插拔/刷新事件：允许兜底观察重新武装。
@@ -1052,37 +1070,9 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// 设备已从 usbipd state 消失（物理拔出）。若它此前 attached，说明其
-    /// 自动附加守护进程应随之退出；附加中/刚附加过则跳过，避免中途误杀。
+    /// 设备已物理拔出（state 中由 attached 变为消失或不再 connected）。
+    /// 立即停止对应 auto-attach 守护进程；重插后由插入检测重新附加启动。
     fn stop_daemons_for_removed(&mut self, dev: &UsbDevice) {
-        let now = Instant::now();
-        let recent = self
-            .pending_attach
-            .get(&dev.hardware_id)
-            .is_some_and(|t| now.duration_since(*t) < ATTACH_GUARD_WINDOW);
-        if recent {
-            log::info(&format!(
-                "device removal during attach window, daemon kept: hwid={}",
-                dev.hardware_id
-            ));
-            return;
-        }
-        let id = if self.cfg.app_config.use_bus_id {
-            &dev.bus_id
-        } else {
-            &dev.hardware_id
-        };
-        let attaching = self
-            .daemons
-            .lock()
-            .map(|mut dm| dm.attaching(id))
-            .unwrap_or(false);
-        if attaching {
-            log::info(&format!(
-                "device removal while attaching, daemon kept: id={id}"
-            ));
-            return;
-        }
         let mut needles: Vec<String> = Vec::new();
         if !dev.bus_id.is_empty() {
             needles.push(dev.bus_id.clone());
@@ -1096,7 +1086,7 @@ impl App {
             }
         }
         log::info(&format!(
-            "attached device removed, auto-attach daemon stopped: hwid={} bus={}",
+            "attached device unplugged, auto-attach daemon stopped: hwid={} bus={}",
             dev.hardware_id, dev.bus_id
         ));
     }
