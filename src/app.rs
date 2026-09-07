@@ -23,8 +23,6 @@ const USB_EVENT_COOLDOWN: Duration = Duration::from_millis(900);
 const USB_RECHECK_INTERVAL: Duration = Duration::from_millis(600);
 /// 单次广播触发后最多自动补查次数（state 相对广播有短暂滞后）。
 const USB_RECHECK_LIMIT: u8 = 2;
-/// 存在 attached 设备时的兜底轮询间隔。
-const ATTACHED_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// 附加过程中的宽限期，期间不因 state 差集停止守护进程。
 const ATTACH_GUARD_WINDOW: Duration = Duration::from_secs(15);
 
@@ -129,13 +127,8 @@ pub struct App {
     usb_rechecks: u8,
     /// 最近一次由 USB 广播发起的 state 查询时间（风暴冷却用）。
     last_usb_refresh: Option<Instant>,
-    /// 最近一次拿到 usbipd state（成功或失败）的时间，供兜底轮询错峰。
-    last_list_at: Option<Instant>,
     /// 上一次完整 usbipd state 快照，用于差集判断。
     state_snapshot: Option<Vec<UsbDevice>>,
-    /// 静默兜底检查是否已在途（不占用 busy，避免 spinner 每秒闪动）。
-    state_poll_inflight: bool,
-    last_state_sync: Option<Instant>,
 
     show_settings: bool,
     settings_draft: AppConfig,
@@ -186,10 +179,7 @@ impl App {
             usb_activity_pending: false,
             usb_rechecks: 0,
             last_usb_refresh: None,
-            last_list_at: None,
             state_snapshot: None,
-            state_poll_inflight: false,
-            last_state_sync: None,
             show_settings: false,
             settings_draft: AppConfig::default(),
             toasts: Vec::new(),
@@ -287,14 +277,10 @@ impl App {
                 }
                 UiMsg::Lists(devices) => {
                     self.busy = false;
-                    self.state_poll_inflight = false;
-                    self.last_list_at = Some(Instant::now());
                     self.apply_state_snapshot(devices, ctx);
                 }
                 UiMsg::ListFailed(e) => {
                     self.busy = false;
-                    self.state_poll_inflight = false;
-                    self.last_list_at = Some(Instant::now());
                     log::warn(&format!("usbipd state fetch failed: {e}"));
                     if self.initialized {
                         // 只提示，绝不清空当前列表，避免瞬时失败误杀守护进程。
@@ -533,30 +519,6 @@ impl App {
                 }
             })
             .expect("spawn refresh thread");
-    }
-
-    /// 静默兜底检查：不使用 `busy`/spinner，只在结果真正变化时更新 UI。
-    /// 供“存在 attached 设备”时的低频兜底轮询调用。
-    fn start_quiet_state_poll(&mut self) {
-        if self.state_poll_inflight {
-            return;
-        }
-        let Some(client) = self.usbipd.clone() else {
-            return;
-        };
-        self.state_poll_inflight = true;
-        let tx = self.tx.clone();
-        std::thread::Builder::new()
-            .name("usbipd-state-poll".to_owned())
-            .spawn(move || match client.list_devices() {
-                Ok(list) => {
-                    let _ = tx.send(UiMsg::Lists(list));
-                }
-                Err(e) => {
-                    let _ = tx.send(UiMsg::ListFailed(e));
-                }
-            })
-            .expect("spawn quiet state poll thread");
     }
 
     fn run_op(
@@ -1080,40 +1042,6 @@ impl App {
                 expires: Instant::now() + Duration::from_secs(5),
             });
         }
-    }
-
-    /// 兜底轮询：设备已附加到 WSL 时（无论守护进程是否由本程序管理），
-    /// Windows 广播可能不可靠，按固定间隔对 usbipd state 做差集。无变化
-    /// 时不会重建列表/重绘，因此不会出现“一直在刷新列表”。
-    pub(crate) fn poll_state_sync(&mut self, ctx: &egui::Context) {
-        if !self.initialized || self.busy {
-            return;
-        }
-        let has_attached = self
-            .state_snapshot
-            .as_ref()
-            .is_some_and(|list| list.iter().any(|d| d.is_attached && d.is_connected));
-        if !has_attached {
-            return;
-        }
-        // 保持定时唤醒，让兜底轮询持续生效（attached 设备存在期间）。
-        ctx.request_repaint_after(ATTACHED_POLL_INTERVAL);
-        let now = Instant::now();
-        if self
-            .last_state_sync
-            .is_some_and(|t| now.duration_since(t) < ATTACHED_POLL_INTERVAL)
-        {
-            return;
-        }
-        // 广播驱动的刷新刚完成时让位于它（错峰、避免重复查询）。
-        if self
-            .last_list_at
-            .is_some_and(|t| now.duration_since(t) < ATTACHED_POLL_INTERVAL)
-        {
-            return;
-        }
-        self.last_state_sync = Some(now);
-        self.start_quiet_state_poll();
     }
 
     /// 自动附加被防抖推迟后的定时重试：到期时触发一次状态刷新，

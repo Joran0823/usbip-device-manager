@@ -287,9 +287,8 @@ usbipd.exe state
    `maybe_auto_attach` 触发自动附加（8 秒防抖到期后自动补一次评估）；
 5. 由于 `usbipd state` 相对广播有短暂滞后，广播触发后若快照无变化会
    自动补查（600ms × 至多 2 次）；
-6. 设备已附加到 WSL 时物理拔出可能没有 Windows 通知，此时由
-   `poll_state_sync` 以 1s 间隔做**静默**兜底差集（后台执行、不占用
-   busy/spinner；仅在存在 attached 设备时生效，无变化不重绘）。
+6. 不设任何周期性轮询：插拔（包括附加到 WSL 的设备拔出时伴随的导出/
+   影子节点变化）都会产生 `WM_DEVICECHANGE` 广播，触发一次 state 检查。
 
 曾经的“插入约 7 秒后才显示”主要是旧实现每次事件都冷启动 PowerShell
 （约 276ms/次），事件风暴造成连续启动多个 PowerShell 并互相竞争；
@@ -302,11 +301,10 @@ egui 是单线程渲染模型，所有耗时工作放在后台线程，结果经
 
 | 线程 | 职责 | 触发 |
 | --- | --- | --- |
-| UI 主线程（`logic`/`ui`） | 渲染、收消息、flush USB 活动、兜底轮询、分发 Action | 常驻 |
+| UI 主线程（`logic`/`ui`） | 渲染、收消息、flush USB 活动、分发 Action | 常驻 |
 | `usbipd-check` | 检测安装/版本 | App 启动一次 |
 | `refresh` | `list_devices()` 刷新 | 手动刷新/切页/初始化 |
 | `usbipd-op` | bind/unbind/attach/detach 等一次操作 | 每次用户操作 |
-| `usbipd-state-poll` | 静默兜底 state 差集（不置 busy，无变化不重绘） | 存在 attached 设备时每 1s |
 | `usb-monitor` | 监听 WM_DEVICECHANGE 广播（200ms 合并） | App 生命周期内 |
 | `tray-menu` | 托盘菜单事件 | 托盘存在期间 |
 
@@ -357,8 +355,8 @@ cargo build --release
 
 - bind/unbind 依赖 UAC/EPM 放行（见 7.3）；后续可加“进程已提权则直跑
   usbipd”检测；
-- USB 插拔依赖 `usbipd state` 差集：附加到 WSL 的设备物理拔出若完全
-  没有 Windows 广播，最长需 1s 兜底轮询才能发现；
+- USB 插拔依赖广播触发：若个别环境对“附加到 WSL 的设备拔出”完全不产生
+  Windows 广播，列表需手动刷新才会更新；
 - 单实例、单 usbipd 工作流是刻意取舍，避免并发命令互相干扰；
 - 配置目录继续使用 `WSL USB Manager` 名称以兼容旧版，换新名会丢配置；
 - 若未来需要兼容 4.4.0 之前的 usbipd（无 `state` JSON），可保留

@@ -329,10 +329,9 @@ source the UI renders from, so it cannot misreport.
    re-evaluation once the 8 s debounce expires);
 5. Because `usbipd state` lags the broadcast slightly, an unchanged snapshot
    after a broadcast triggers up to 2 extra checks 600 ms apart;
-6. A physical unplug of a device attached to WSL may produce no Windows
-   notification at all; `poll_state_sync` covers that with a silent 1 s
-   fallback diff (background thread, no busy/spinner; active only while
-   attached devices exist and repainting only on real changes).
+6. There is no periodic polling at all: plug/unplug -- including the
+   export/shadow node changes that accompany removal of a device attached to
+   WSL -- produces `WM_DEVICECHANGE` broadcasts that trigger one state check.
 
 The old "~7 s delay after plug-in" was caused by cold-starting PowerShell
 (~276 ms each) for every event, so event bursts launched competing PowerShell
@@ -347,11 +346,10 @@ frame by the UI thread.
 
 | Thread | Responsibility | Trigger |
 | --- | --- | --- |
-| UI main thread (`logic`/`ui`) | Rendering, message draining, USB activity flush, fallback polling, Action dispatch | Always running |
+| UI main thread (`logic`/`ui`) | Rendering, message draining, USB activity flush, Action dispatch | Always running |
 | `usbipd-check` | Installation/version detection | Once at startup |
 | `refresh` | `list_devices()` refresh | Manual refresh/tab switch/init |
 | `usbipd-op` | One-shot bind/unbind/attach/detach operations | Per user operation |
-| `usbipd-state-poll` | Silent fallback state diff (no busy; repaint only on change) | Every 1 s while attached devices exist |
 | `usb-monitor` | WM_DEVICECHANGE broadcast listener (200 ms coalescing) | App lifetime |
 | `tray-menu` | Tray menu events | While the tray exists |
 
@@ -404,9 +402,9 @@ Test coverage highlights:
 
 - bind/unbind depends on UAC/EPM approval (see 7.3); a "run usbipd directly
   when the process is already elevated" check is a future addition;
-- USB plug/unplug relies on `usbipd state` diffs: when a device attached to
-  WSL is physically removed with no Windows broadcast at all, discovery can
-  take up to the 1 s fallback poll;
+- USB plug/unplug relies on broadcast triggers: on the rare environment where
+  removal of a device attached to WSL produces no Windows broadcast at all,
+  the list only updates on a manual refresh;
 - single instance / single usbipd workflow is a deliberate trade-off to avoid
   concurrent commands interfering;
 - the config directory intentionally stays `WSL USB Manager` for compatibility;
