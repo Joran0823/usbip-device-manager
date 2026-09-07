@@ -24,7 +24,9 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.process_messages(ctx);
-        self.flush_usb_change(ctx);
+        self.flush_usb_activity(ctx);
+        self.poll_state_sync(ctx);
+        self.check_auto_retry(ctx);
         if self.is_exiting() {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
@@ -41,7 +43,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.process_messages(&ctx);
-        self.flush_usb_change(&ctx);
+        self.flush_usb_activity(&ctx);
 
         if self.is_exiting() {
             ctx.send_viewport_cmd(ViewportCommand::Close);

@@ -1,14 +1,20 @@
 // Copyright (c) 2026 Joran
 // SPDX-License-Identifier: MIT
 
-//! Detects USB plug/unplug through `RegisterDeviceNotification`
-//! (`WM_DEVICECHANGE`) on a hidden top-level window. The thread blocks in
-//! `GetMessageW`; device notifications are synchronous `SendMessage` calls,
-//! so they are handled directly in the window procedure, which triggers an
-//! enumeration diff. There is no periodic polling.
+//! Windows USB change broadcast watcher.
+//!
+//! A hidden top-level window receives `WM_DEVICECHANGE` notifications
+//! (`DBT_DEVICEARRIVAL`, `DBT_DEVICEREMOVECOMPLETE` and the `DBT_DEVNODES_CHANGED`
+//! broadcast) through `RegisterDeviceNotification`. These broadcasts are only
+//! used as a *trigger*: the watcher never enumerates or identifies a device
+//! itself, because Windows PnP noise (attach side effects, node swaps, dense
+//! bus broadcasts) cannot be reliably mapped to a physical plug/unplug.
+//!
+//! Bursts of events are coalesced with a short timer; when the traffic settles
+//! the watcher signals the UI thread ("something USB-related changed"), which
+//! then refreshes `usbipd state` and acts on the real device diff.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,29 +34,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::core::{GUID, PCWSTR};
 
 use crate::log;
-use crate::sys;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsbChange {
-    pub instance_id: String,
-    pub connected: bool,
-}
-
-/// 窗口过程与消息循环运行在同一线程。这里保存“上次快照 + 回调”，
-/// 让 wnd_proc 收到 WM_DEVICECHANGE 时能直接触发枚举差集。
-struct MonitorCtx {
-    previous: HashSet<String>,
-    cb: Box<dyn Fn(UsbChange) + Send>,
-}
-
-thread_local! {
-    static CTX: RefCell<Option<MonitorCtx>> = const { RefCell::new(None) };
-}
+/// `DBT_DEVNODES_CHANGED` is broadcast to all top-level windows for PnP node
+/// changes. It is noisy, but harmless here because it only schedules a state
+/// check whose result is authoritative.
+const DBT_DEVNODES_CHANGED: u32 = 0x0007;
 
 const WINDOW_CLASS: &str = "usbipdm-usb-notify";
 
-/// dbcc_classguid = GUID_NULL：注册“所有设备接口类”的通知，
-/// 由调用方在收到事件后枚举过滤。
+/// `dbcc_classguid = GUID_NULL`: receive notifications for all device
+/// interface classes. Device identity is never read from the notification.
 const ALL_CLASSES_GUID: GUID = GUID {
     data1: 0,
     data2: 0,
@@ -58,7 +51,20 @@ const ALL_CLASSES_GUID: GUID = GUID {
     data4: [0; 8],
 };
 
-const RECHECK_TIMER_ID: usize = 1;
+/// Coalescing delay: a physical insert/remove emits several broadcasts, and
+/// they are collapsed into a single signal once traffic settles.
+const COALESCE_MS: u32 = 200;
+const COALESCE_TIMER_ID: usize = 1;
+
+struct MonitorCtx {
+    /// `true` while a coalescing timer is pending.
+    pending: bool,
+    cb: Box<dyn Fn() + Send>,
+}
+
+thread_local! {
+    static CTX: RefCell<Option<MonitorCtx>> = const { RefCell::new(None) };
+}
 
 pub struct UsbMonitor {
     handle: Option<JoinHandle<()>>,
@@ -69,7 +75,7 @@ pub struct UsbMonitor {
 impl UsbMonitor {
     pub fn start<F>(cb: F) -> Self
     where
-        F: Fn(UsbChange) + Send + 'static,
+        F: Fn() + Send + 'static,
     {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_id: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
@@ -115,35 +121,35 @@ impl Drop for UsbMonitor {
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
     if msg == WM_DEVICECHANGE {
-        log::info(&format!(
-            "WM_DEVICECHANGE (sent) wparam=0x{:X}",
-            wparam as u32
-        ));
         let w = wparam as u32;
-        if w == DBT_DEVICEARRIVAL || w == DBT_DEVICEREMOVECOMPLETE {
-            // 设备通知是同步 SendMessage，直接在窗口过程里做枚举差集；
-            // SetupAPI 通常比通知晚几百毫秒更新，故再挂一个 400ms 定时器补查。
+        if w == DBT_DEVICEARRIVAL || w == DBT_DEVICEREMOVECOMPLETE || w == DBT_DEVNODES_CHANGED {
+            log::info(&format!("WM_DEVICECHANGE (sent) wparam=0x{w:X}"));
+            // 只记录“有变化发生”，不做任何枚举或设备识别；200ms 后合并为一个信号。
             CTX.with(|ctx| {
                 if let Ok(mut guard) = ctx.try_borrow_mut() {
                     if let Some(c) = guard.as_mut() {
-                        emit_diff(&mut c.previous, &*c.cb);
+                        if !c.pending {
+                            c.pending = true;
+                            unsafe {
+                                let _ = SetTimer(hwnd, COALESCE_TIMER_ID, COALESCE_MS, None);
+                            }
+                            log::info("USB broadcast burst: state check scheduled");
+                        }
                     }
                 }
             });
-            unsafe {
-                let _ = SetTimer(hwnd, RECHECK_TIMER_ID, 400, None);
-            }
             return 1;
         }
     }
-    if msg == WM_TIMER && wparam == RECHECK_TIMER_ID {
+    if msg == WM_TIMER && wparam == COALESCE_TIMER_ID {
         unsafe {
-            let _ = KillTimer(hwnd, RECHECK_TIMER_ID);
+            let _ = KillTimer(hwnd, COALESCE_TIMER_ID);
         }
         CTX.with(|ctx| {
             if let Ok(mut guard) = ctx.try_borrow_mut() {
                 if let Some(c) = guard.as_mut() {
-                    emit_diff(&mut c.previous, &*c.cb);
+                    c.pending = false;
+                    (c.cb)();
                 }
             }
         });
@@ -156,28 +162,9 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn emit_diff(previous: &mut HashSet<String>, cb: &dyn Fn(UsbChange)) {
-    let current: HashSet<String> = sys::usb_instance_ids().into_iter().collect();
-    for id in current.difference(previous) {
-        log::info(&format!("USB device plugged: {id}"));
-        cb(UsbChange {
-            instance_id: id.clone(),
-            connected: true,
-        });
-    }
-    for id in previous.difference(&current) {
-        log::info(&format!("USB device unplugged: {id}"));
-        cb(UsbChange {
-            instance_id: id.clone(),
-            connected: false,
-        });
-    }
-    *previous = current;
-}
-
 fn monitor_loop<F>(cb: F, stop: Arc<AtomicBool>, thread_id: Arc<Mutex<Option<u32>>>)
 where
-    F: Fn(UsbChange) + Send + 'static,
+    F: Fn() + Send + 'static,
 {
     let class_name = wide(WINDOW_CLASS);
     let class_ptr: PCWSTR = class_name.as_ptr();
@@ -217,7 +204,7 @@ where
 
         CTX.with(|ctx| {
             *ctx.borrow_mut() = Some(MonitorCtx {
-                previous: sys::usb_instance_ids().into_iter().collect(),
+                pending: false,
                 cb: Box::new(cb),
             });
         });
@@ -240,7 +227,7 @@ where
         if let Ok(mut tid) = thread_id.lock() {
             *tid = Some(GetCurrentThreadId());
         }
-        log::info("USB notification window ready (event-driven)");
+        log::info("USB notification window ready (broadcast -> usbipd state check)");
 
         let mut msg: windows_sys::Win32::UI::WindowsAndMessaging::MSG = std::mem::zeroed();
         loop {

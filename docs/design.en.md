@@ -38,7 +38,7 @@ Design goals:
 | `image` | Loading/resizing the tray and window icons |
 | `serde` / `serde_json` | `config.json` and `usbipd state` JSON parsing |
 | `winreg` | Looking up usbipd-win installation in the registry |
-| `windows-sys` 0.61 | SetupAPI, ShellExecuteEx, registry, network cards, locale, etc. |
+| `windows-sys` 0.61 | ShellExecuteEx, registry, network cards, locale, WM_DEVICECHANGE broadcasts, etc. |
 | `embed-resource` (build) | Embedding `appicon.ico` into the executable resources |
 
 Windows 10+ only; Rust edition 2024. No .NET or PowerShell dependency.
@@ -52,8 +52,8 @@ src/
   ui.rs        egui rendering: pages/lists/context menus/info area/settings/dialog/toasts
   usbipd.rs    usbipd-win detection, `usbipd state` JSON parsing, bind/attach, daemons
   config.rs    Config structures (PascalCase JSON, compatible with the original C# app)
-  sys.rs       Win32 helpers: elevation, registry, network cards, SetupAPI, single instance, locale
-  monitor.rs   USB hot-plug polling monitor thread
+  sys.rs       Win32 helpers: elevation, registry, network cards, single instance, locale
+  monitor.rs   USB hot-plug broadcast watcher (trigger only, no device lookup)
   lang.rs      Chinese/English strings and current language state
   theme.rs     Dark/light theme
   log.rs       File logger
@@ -69,8 +69,8 @@ assets/
 | `app.rs` | `App` state; `UiMsg` handling; `Action` dispatch; background workers; tray creation |
 | `ui.rs` | Per-frame rendering; page layout with independent scroll areas; context menus; dialogs and toasts |
 | `usbipd.rs` | `Usbipd::check()`, `list_devices()` (JSON), bind/unbind/attach/detach, `DaemonManager` |
-| `sys.rs` | `run_elevated`, `find_installed_app`, `network_cards`, `usb_hardware_ids`, single instance, locale |
-| `monitor.rs` | Polls the SetupAPI device list every 250 ms and emits plug/unplug events on diffs |
+| `sys.rs` | `run_elevated`, `find_installed_app`, `network_cards`, single instance, locale |
+| `monitor.rs` | Hidden window with device notification; emits a coalesced "state check needed" signal (no device lookup) |
 | `config.rs` | `SystemConfig`/`AppConfig`/`UsbDevice` and read/write helpers, paths |
 | `theme.rs` | Dark/light `Visuals`/`Style` and theme-aware color getters |
 | `lang.rs` | String keys to Chinese/English; `lang::t()`; startup language detection |
@@ -87,7 +87,7 @@ assets/
    `zh`).
 4. Create the eframe window (title bar icon == tray icon) and start:
    - a `usbipd-check` thread running `Usbipd::check()`;
-   - the `UsbMonitor` 250 ms USB enumeration poll;
+   - the `UsbMonitor` hidden-window USB broadcast listener (trigger only);
    - the tray icon and its menu event thread.
 5. On `UiMsg::UsbipdReady`, the app becomes ready and triggers the first list
    refresh.
@@ -308,30 +308,36 @@ to confirm the change instead of trusting only the exit code:
 
 ## 8. USB Hot-Plug Monitoring
 
-`monitor.rs` + `sys::usb_hardware_ids()` provide poll-based monitoring:
+Principle: **Windows broadcasts are only a trigger; device add/remove is
+decided by diffing consecutive `usbipd state` snapshots**. Windows PnP
+notifications produce node add/remove and shadow-device swaps during attach
+(e.g. `VID_0403` ↔ `VID_80EE`) plus dense 0x7 broadcasts, so they cannot be
+reliably mapped back to a physical plug/unplug. `usbipd state` is the same
+source the UI renders from, so it cannot misreport.
 
-1. Every 250 ms, enumerate present USB devices with SetupAPI
-   (class=USB, DIGCF_PRESENT|ALLCLASSES), extract an uppercase `VID:PID` set
-   (sorted and deduplicated);
-2. Diff against the previous set: additions emit `connected=true`, removals
-   `connected=false`, reported as `UiMsg::UsbChanged` followed by
-   `request_repaint()`;
-3. `queue_usb_change` coalesces events in the UI frame: nothing happens while
-   busy/listing; if the last refresh was under 900 ms ago the system is still
-   enumerating and events keep being merged;
-4. After the cooldown, a `usb-event` thread runs one `list_devices()` to
-   refresh all three pages, posts a status toast for the changed device, and
-   `maybe_auto_attach` attaches matching auto devices.
+1. `monitor.rs` registers device notifications on a hidden top-level window;
+   on `WM_DEVICECHANGE` (0x8000/0x8004/0x7) it only coalesces for 200 ms and
+   sends `UiMsg::UsbActivity` -- no enumeration, no device identity;
+2. In the UI frame `flush_usb_activity` waits out a 900 ms storm cooldown,
+   then the `refresh` thread runs one `list_devices()` and the result is
+   diffed against the previous snapshot;
+3. An unchanged snapshot rebuilds/repaints nothing (kills the endless
+   refresh after a successful attach);
+4. A changed snapshot rebuilds all three pages and repaints; a device that
+   vanished while attached stops its auto-attach daemon by busid/VID:PID;
+   new devices are picked up by `maybe_auto_attach` (with a delayed
+   re-evaluation once the 8 s debounce expires);
+5. Because `usbipd state` lags the broadcast slightly, an unchanged snapshot
+   after a broadcast triggers up to 2 extra checks 600 ms apart;
+6. A physical unplug of a device attached to WSL may produce no Windows
+   notification at all; `poll_state_sync` covers that with a 1 s fallback
+   diff, active only while attached devices exist and repainting only on
+   real changes.
 
-The old "~7 s delay after plug-in" was caused by two combined factors:
-
-- Windows enumerates composite/multi-interface devices one by one, producing
-  a burst of events over several seconds;
-- the old implementation cold-started PowerShell (~276 ms each) for every
-  event, launching competing PowerShell processes during the burst.
-
-With coalescing + a single native `usbipd state` call (~60 ms), each
-plug/unplug now triggers exactly one refresh, and latency dropped noticeably.
+The old "~7 s delay after plug-in" was caused by cold-starting PowerShell
+(~276 ms each) for every event, so event bursts launched competing PowerShell
+processes. Debouncing plus a single native `usbipd state` call dropped the
+latency noticeably.
 
 ## 9. Threading Model and Messaging
 
@@ -341,12 +347,11 @@ frame by the UI thread.
 
 | Thread | Responsibility | Trigger |
 | --- | --- | --- |
-| UI main thread (`logic`/`ui`) | Rendering, message draining, USB flush, Action dispatch | Always running |
+| UI main thread (`logic`/`ui`) | Rendering, message draining, USB activity flush, fallback polling, Action dispatch | Always running |
 | `usbipd-check` | Installation/version detection | Once at startup |
 | `refresh` | `list_devices()` refresh | Manual refresh/tab switch/init |
 | `usbipd-op` | One-shot bind/unbind/attach/detach operations | Per user operation |
-| `usb-event` | List refresh after a coalesced hot-plug event | Per coalesced event |
-| `usb-monitor` | 250 ms SetupAPI polling | App lifetime |
+| `usb-monitor` | WM_DEVICECHANGE broadcast listener (200 ms coalescing) | App lifetime |
 | `tray-menu` | Tray menu events | While the tray exists |
 
 Core messages (`UiMsg`):
@@ -354,12 +359,11 @@ Core messages (`UiMsg`):
 | Message | Meaning and handling |
 | --- | --- |
 | `UsbipdReady` | usbipd check done: mark ready, trigger first refresh |
-| `Lists(Vec<UsbDevice>)` | Refresh result: rebuild the three pages, restore selection, auto attach |
-| `UsbListFinished` | List task done: clear busy |
+| `Lists(Vec<UsbDevice>)` | State snapshot: diff-driven decisions (stop daemon/auto attach/toast), rebuild only on change |
+| `ListFailed` | State fetch failed: notify but keep the current list |
 | `OpDone` | Operation result: toast/error dialog, then refresh |
 | `Error` | Error: log + dialog |
-| `UsbChanged` | Hot-plug event: coalesce and debounce |
-| `UsbNotify` | Status toast after a hot-plug refresh |
+| `UsbActivity` | USB broadcast signal: coalesce, then one state check |
 | `ShowWindow` / `ExitApp` | Tray commands |
 
 The `busy` flag serializes work: clicking Refresh during an operation only
@@ -399,8 +403,9 @@ Test coverage highlights:
 
 - bind/unbind depends on UAC/EPM approval (see 7.3); a "run usbipd directly
   when the process is already elevated" check is a future addition;
-- USB monitoring is a 250 ms poll rather than event-driven; SetupAPI device
-  notifications could remove the polling interval (low cost, low gain);
+- USB plug/unplug relies on `usbipd state` diffs: when a device attached to
+  WSL is physically removed with no Windows broadcast at all, discovery can
+  take up to the 1 s fallback poll;
 - single instance / single usbipd workflow is a deliberate trade-off to avoid
   concurrent commands interfering;
 - the config directory intentionally stays `WSL USB Manager` for compatibility;

@@ -39,7 +39,7 @@
 
 ## 运行环境
 
-- Windows 10+（仅 Windows；使用 SetupAPI/ShellExecuteEx/注册表等 Win32 API）
+- Windows 10+（仅 Windows；使用 WM_DEVICECHANGE 广播、ShellExecuteEx、注册表等 Win32 API）
 - Rust 1.95+（edition 2024）
 - usbipd-win 4.4.0 或更高版本
 
@@ -64,8 +64,8 @@ src/
   ui.rs        egui 界面渲染
   usbipd.rs    usbipd-win 检测、usbipd state JSON 解析、绑定/附加/分离、守护进程
   config.rs    配置读写（与原 config.json 字段兼容）
-  sys.rs       Win32 帮助：UAC 提权、注册表、网卡、USB 枚举、单实例
-  monitor.rs   USB 插拔轮询监控
+  sys.rs       Win32 帮助：UAC 提权、注册表、网卡、单实例
+  monitor.rs   USB 插拔广播监听（触发 usbipd state 差集）
   lang.rs      中英文文案
   log.rs       文件日志
 assets/       图标（从原仓库复制）

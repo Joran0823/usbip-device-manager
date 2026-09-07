@@ -52,7 +52,7 @@ in the current version:
 
 ## Requirements
 
-- Windows 10+ (Windows only; uses SetupAPI/ShellExecuteEx/registry and other
+- Windows 10+ (Windows only; uses WM_DEVICECHANGE broadcasts, ShellExecuteEx, registry and other
   Win32 APIs)
 - Rust 1.95+ (edition 2024)
 - usbipd-win 4.4.0 or later
@@ -79,8 +79,8 @@ src/
   ui.rs        egui UI rendering
   usbipd.rs    usbipd-win detection, `usbipd state` JSON parsing, bind/attach/detach, daemons
   config.rs    Config read/write (field-compatible with the original config.json)
-  sys.rs       Win32 helpers: UAC elevation, registry, network cards, USB enumeration, single instance
-  monitor.rs   USB plug/unplug polling monitor
+  sys.rs       Win32 helpers: UAC elevation, registry, network cards, single instance
+  monitor.rs   USB plug/unplug broadcast watcher (triggers `usbipd state` diffs)
   lang.rs      Chinese/English strings
   log.rs       File logger
 assets/        Icons (copied from the original repository)

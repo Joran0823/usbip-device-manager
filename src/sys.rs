@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Windows-specific helpers: elevated process, registry lookup, adapters,
-//! USB device enumeration, locale and process helpers.
+//! locale and process helpers.
 
 use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
@@ -423,74 +423,4 @@ pub fn network_cards() -> Vec<(String, String)> {
     }
     result.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     result
-}
-
-// ---------------------------------------------------------------------------
-// USB device enumeration (SetupAPI)
-// ---------------------------------------------------------------------------
-
-/// Enumerate present USB PnP device nodes and return their full Windows
-/// device instance ids (e.g. `USB\VID_0403&PID_6001\A50285BI`). The instance
-/// id uniquely identifies a device instance and matches the `InstanceId`
-/// reported by `usbipd state`.
-pub fn usb_instance_ids() -> Vec<String> {
-    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-        DIGCF_ALLCLASSES, DIGCF_PRESENT, SP_DEVINFO_DATA, SetupDiDestroyDeviceInfoList,
-        SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW,
-    };
-
-    let mut ids = Vec::new();
-    unsafe {
-        let usb = to_wide("USB");
-        let set = SetupDiGetClassDevsW(
-            ptr::null(),
-            usb.as_ptr(),
-            ptr::null_mut(),
-            DIGCF_PRESENT | DIGCF_ALLCLASSES,
-        );
-        if set == 0 {
-            return ids;
-        }
-        let mut idx: u32 = 0;
-        loop {
-            let mut data: SP_DEVINFO_DATA = std::mem::zeroed();
-            data.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
-            if SetupDiEnumDeviceInfo(set, idx, &mut data) == 0 {
-                break;
-            }
-            idx += 1;
-
-            let mut required: u32 = 0;
-            SetupDiGetDeviceInstanceIdW(set, &data, ptr::null_mut(), 0, &mut required);
-            if required == 0 {
-                continue;
-            }
-            let mut buf = vec![0u16; required as usize + 2];
-            if SetupDiGetDeviceInstanceIdW(
-                set,
-                &data,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-                &mut required,
-            ) != 0
-            {
-                let id = from_wide(buf.as_ptr());
-                if is_bindable_usb_instance(&id) {
-                    ids.push(id);
-                }
-            }
-        }
-        SetupDiDestroyDeviceInfoList(set);
-    }
-    ids.sort();
-    ids.dedup();
-    ids
-}
-
-/// usbipd-win 可管理的 USB 设备节点：实例 ID 形如
-/// `USB\VID_xxxx&PID_yyyy\...`，排除 hub（无 VID/PID）和复合设备的功能
-/// 子节点（含 `&MI_xx`），以便与 `usbipd state` 的 InstanceId 对齐。
-fn is_bindable_usb_instance(instance_id: &str) -> bool {
-    let upper = instance_id.to_ascii_uppercase();
-    upper.contains("\\VID_") && upper.contains("&PID_") && !upper.contains("&MI_")
 }

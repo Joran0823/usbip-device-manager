@@ -8,13 +8,25 @@
 use crate::config::{self, AppConfig, SystemConfig, UsbDevice};
 use crate::lang;
 use crate::log;
-use crate::monitor::{UsbChange, UsbMonitor};
+use crate::monitor::UsbMonitor;
 use crate::usbipd::{self, DaemonManager, Usbipd};
 use eframe::egui;
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+// USB 广播事件触发 usbipd state 查询的去抖 / 补查参数。
+/// 广播风暴后等待枚举稳定再查询的冷却时间。
+const USB_EVENT_COOLDOWN: Duration = Duration::from_millis(900);
+/// 查询后 state 未变化的自动补查间隔。
+const USB_RECHECK_INTERVAL: Duration = Duration::from_millis(600);
+/// 单次广播触发后最多自动补查次数（state 相对广播有短暂滞后）。
+const USB_RECHECK_LIMIT: u8 = 2;
+/// 存在 attached 设备时的兜底轮询间隔。
+const ATTACHED_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// 附加过程中的宽限期，期间不因 state 差集停止守护进程。
+const ATTACH_GUARD_WINDOW: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
@@ -42,10 +54,9 @@ pub struct Toast {
 pub enum UiMsg {
     Error(String),
     Lists(Vec<UsbDevice>),
+    ListFailed(String),
     OpDone { ok: bool, message: String },
-    UsbNotify(Option<String>),
-    UsbChanged(UsbChange),
-    UsbListFinished,
+    UsbActivity,
     ShowWindow,
     ExitApp,
     UsbipdReady(Result<(Usbipd, Option<String>), String>),
@@ -110,9 +121,19 @@ pub struct App {
     initialized: bool,
     pub(crate) need_refresh: bool,
     pending_attach: HashMap<String, Instant>,
-    pending_usb: Option<UsbChange>,
+    /// 自动附加被“8 秒防抖”推迟后，下一次重新评估的时间。
+    auto_retry_at: Option<Instant>,
+    /// 收到 USB 广播后待处理的“查询一次 usbipd state”标记（去抖合并）。
+    usb_activity_pending: bool,
+    /// 广播后 state 尚未反映变化时的自动补查剩余次数。
+    usb_rechecks: u8,
+    /// 最近一次由 USB 广播发起的 state 查询时间（风暴冷却用）。
     last_usb_refresh: Option<Instant>,
-    usb_listing: bool,
+    /// 最近一次拿到 usbipd state（成功或失败）的时间，供兜底轮询错峰。
+    last_list_at: Option<Instant>,
+    /// 上一次完整 usbipd state 快照，用于差集判断。
+    state_snapshot: Option<Vec<UsbDevice>>,
+    last_state_sync: Option<Instant>,
 
     show_settings: bool,
     settings_draft: AppConfig,
@@ -159,9 +180,13 @@ impl App {
             initialized: false,
             need_refresh: false,
             pending_attach: HashMap::new(),
-            pending_usb: None,
+            auto_retry_at: None,
+            usb_activity_pending: false,
+            usb_rechecks: 0,
             last_usb_refresh: None,
-            usb_listing: false,
+            last_list_at: None,
+            state_snapshot: None,
+            last_state_sync: None,
             show_settings: false,
             settings_draft: AppConfig::default(),
             toasts: Vec::new(),
@@ -191,11 +216,11 @@ impl App {
                 let _ = tx2.send(UiMsg::UsbipdReady(Usbipd::check()));
             })?;
 
-        let tx4 = app.tx.clone();
-        let egui_ctx = cc.egui_ctx.clone();
-        app.monitor = Some(UsbMonitor::start(move |change| {
-            let _ = tx4.send(UiMsg::UsbChanged(change));
-            egui_ctx.request_repaint();
+        let tx_usb = app.tx.clone();
+        let ctx_usb = cc.egui_ctx.clone();
+        app.monitor = Some(UsbMonitor::start(move || {
+            let _ = tx_usb.send(UiMsg::UsbActivity);
+            ctx_usb.request_repaint();
         }));
         match build_tray(app.tx.clone(), cc.egui_ctx.clone()) {
             Ok(Some((tray, show, exit))) => {
@@ -259,28 +284,30 @@ impl App {
                 }
                 UiMsg::Lists(devices) => {
                     self.busy = false;
-                    log::info(&format!(
-                        "list refreshed: {} device(s) from usbipd state",
-                        devices.len()
-                    ));
-                    self.apply_lists(devices);
-                    ctx.request_repaint();
+                    self.last_list_at = Some(Instant::now());
+                    self.apply_state_snapshot(devices, ctx);
                 }
-                UiMsg::UsbNotify(text) => {
-                    if let Some(text) = text {
+                UiMsg::ListFailed(e) => {
+                    self.busy = false;
+                    self.last_list_at = Some(Instant::now());
+                    log::warn(&format!("usbipd state fetch failed: {e}"));
+                    if self.initialized {
+                        // 只提示，绝不清空当前列表，避免瞬时失败误杀守护进程。
                         self.toasts.push(Toast {
-                            kind: ToastKind::Info,
-                            text,
-                            expires: Instant::now() + Duration::from_secs(5),
+                            kind: ToastKind::Error,
+                            text: e,
+                            expires: Instant::now() + Duration::from_secs(6),
+                        });
+                    } else {
+                        self.dialog = Some(Dialog {
+                            title: lang::t("Error"),
+                            message: e,
                         });
                     }
-                }
-                UiMsg::UsbChanged(change) => {
-                    self.queue_usb_change(change, ctx);
-                }
-                UiMsg::UsbListFinished => {
-                    self.usb_listing = false;
                     ctx.request_repaint();
+                }
+                UiMsg::UsbActivity => {
+                    self.queue_usb_activity(ctx);
                 }
                 UiMsg::OpDone { ok, message } => {
                     self.busy = false;
@@ -418,6 +445,7 @@ impl App {
         }
         let now = Instant::now();
         let mut candidate: Option<UsbDevice> = None;
+        let mut retry_earliest: Option<Instant> = None;
         for row in &self.device_rows {
             if !row.is_auto || !row.dev.is_connected || row.dev.is_attached {
                 continue;
@@ -440,6 +468,18 @@ impl App {
                 log::info(&format!(
                     "auto attach deferred: id={id} daemon_attaching={attaching} recent_attempt={recent}"
                 ));
+                if recent && !attaching {
+                    let expires = self
+                        .pending_attach
+                        .get(&row.dev.hardware_id)
+                        .map(|t| *t + Duration::from_secs(8))
+                        .unwrap_or(now);
+                    retry_earliest = Some(
+                        retry_earliest
+                            .map(|earliest| earliest.min(expires))
+                            .unwrap_or(expires),
+                    );
+                }
                 continue;
             }
             candidate = Some(row.dev.clone());
@@ -458,6 +498,8 @@ impl App {
             self.pending_attach.insert(dev.hardware_id.clone(), now);
             self.attach(dev, true);
         }
+        // 无论本轮是否触发附加，都保留其它设备“防抖到期后的重试”计划。
+        self.auto_retry_at = retry_earliest;
     }
 
     // ------------------------------------------------------------------
@@ -475,25 +517,14 @@ impl App {
         };
         self.busy = true;
         let tx = self.tx.clone();
-        let started = std::time::Instant::now();
         std::thread::Builder::new()
             .name("refresh".to_owned())
             .spawn(move || match client.list_devices() {
                 Ok(list) => {
-                    log::info(&format!(
-                        "refresh OK: {} device(s) in {} ms",
-                        list.len(),
-                        started.elapsed().as_millis()
-                    ));
                     let _ = tx.send(UiMsg::Lists(list));
                 }
                 Err(e) => {
-                    log::warn(&format!(
-                        "refresh failed after {} ms: {e}",
-                        started.elapsed().as_millis()
-                    ));
-                    let _ = tx.send(UiMsg::Error(e));
-                    let _ = tx.send(UiMsg::Lists(Vec::new()));
+                    let _ = tx.send(UiMsg::ListFailed(e));
                 }
             })
             .expect("spawn refresh thread");
@@ -824,170 +855,252 @@ impl App {
     // USB event handling (called from UI pass)
     // ------------------------------------------------------------------
 
-    /// 接收 USB 插拔事件：短时间内的事件先合并，冷却结束后只刷新一次，
-    /// 避免复合设备枚举时连续多次调用 usbipd state。
-    pub fn queue_usb_change(&mut self, change: UsbChange, ctx: &egui::Context) {
-        log::info(&format!(
-            "USB change queued: instance={} connected={}",
-            change.instance_id, change.connected
-        ));
-        if !change.connected {
-            // 设备附加到 WSL 后 Windows 侧设备节点会消失，SetupAPI 会把它
-            // 误报为“拔出”。这种事件是导出副作用，不是真正的物理拔出：
-            // 若设备仍处于已附加/附加中状态，直接忽略，避免杀掉守护进程
-            // 导致“附加→误判拔出→杀守护→重连”死循环。
-            let row = self
-                .device_rows
-                .iter()
-                .find(|r| r.dev.instance_id.eq_ignore_ascii_case(&change.instance_id));
-            let attached = row.is_some_and(|r| r.dev.is_attached);
-            let recent = row
-                .and_then(|r| self.pending_attach.get(&r.dev.hardware_id))
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(15));
-            if attached || recent || self.busy {
-                log::info(&format!(
-                    "USB unplug while attached/busy ignored (export artifact): instance={}",
-                    change.instance_id
-                ));
-                return;
-            }
-            // 真正的物理拔出：结束 auto-attach 守护进程；重插后由
-            // maybe_auto_attach 重新附加并启动新守护。
-            self.stop_daemon_for_unplug(&change.instance_id);
-        }
-        self.pending_usb = Some(change);
+    /// USB 广播只是“敲门砖”：收到后合并为一次状态查询请求。真正的插拔
+    /// 结论以 usbipd state 快照差集为准（见 [`App::apply_state_snapshot`]）。
+    pub fn queue_usb_activity(&mut self, ctx: &egui::Context) {
+        log::info("USB activity signal received: scheduling usbipd state check");
+        self.usb_activity_pending = true;
+        self.usb_rechecks = USB_RECHECK_LIMIT;
         ctx.request_repaint_after(Duration::from_millis(120));
     }
 
-    /// 拔出事件携带的 InstanceId 与 usbipd state 的 InstanceId 同源。
-    /// 先在当前列表行里按 InstanceId 定位设备，再取出其 hardware_id /
-    /// bus_id 停止对应守护进程（守护进程参数可能使用其中任意一种）。
-    fn stop_daemon_for_unplug(&mut self, instance_id: &str) {
-        let mut needles: Vec<String> = Vec::new();
-        for row in &self.device_rows {
-            if !row.dev.instance_id.eq_ignore_ascii_case(instance_id) {
-                continue;
-            }
-            if !row.dev.bus_id.is_empty() {
-                needles.push(row.dev.bus_id.clone());
-            }
-            if !row.dev.hardware_id.is_empty() {
-                needles.push(row.dev.hardware_id.clone());
-            }
-        }
-        if needles.is_empty() {
-            log::warn(&format!(
-                "USB unplug {}: no matching list row, daemon not stopped",
-                instance_id
-            ));
-            return;
-        }
-        if let Ok(mut dm) = self.daemons.lock() {
-            for needle in needles {
-                dm.stop_matching(&needle);
-            }
-        }
-    }
-
-    /// 每帧尝试处理合并后的 USB 事件（在 logic 与 ui 中调用）。
-    pub fn flush_usb_change(&mut self, ctx: &egui::Context) {
-        if self.busy || self.usb_listing {
-            if self.pending_usb.is_some() {
-                // 事件被忙碌/列表任务占用，安排重绘以便稍后继续处理。
+    /// 每帧处理一次“需要检查 usbipd state”的请求（广播触发或自动补查）。
+    pub fn flush_usb_activity(&mut self, ctx: &egui::Context) {
+        if self.busy {
+            if self.usb_activity_pending || self.usb_rechecks > 0 {
+                // 绑定/附加等操作进行中，稍后重试。
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
             return;
         }
-        let Some(change) = self.pending_usb.take() else {
-            return;
-        };
-        // 若上一次刷新在 900ms 内，说明系统仍在枚举设备，继续合并等待。
-        if self
-            .last_usb_refresh
-            .is_some_and(|t| t.elapsed() < Duration::from_millis(900))
-        {
-            log::info(&format!(
-                "USB change deferred (cooldown): instance={} connected={}",
-                change.instance_id, change.connected
-            ));
-            self.pending_usb = Some(change);
-            ctx.request_repaint_after(Duration::from_millis(150));
+        let now = Instant::now();
+        if self.usb_activity_pending {
+            if self
+                .last_usb_refresh
+                .is_some_and(|t| now.duration_since(t) < USB_EVENT_COOLDOWN)
+            {
+                // 广播风暴还没安静下来：等系统枚举稳定后再查一次。
+                ctx.request_repaint_after(USB_EVENT_COOLDOWN);
+                return;
+            }
+            self.usb_activity_pending = false;
+            log::info("USB activity -> usbipd state check");
+            self.last_usb_refresh = Some(now);
+            self.start_refresh();
             return;
         }
-        log::info(&format!(
-            "USB change processing: instance={} connected={}",
-            change.instance_id, change.connected
-        ));
-        self.last_usb_refresh = Some(Instant::now());
-        self.usb_listing = true;
-        self.start_usb_list(change, ctx);
+        if self.usb_rechecks > 0 {
+            if self
+                .last_usb_refresh
+                .is_some_and(|t| now.duration_since(t) < USB_RECHECK_INTERVAL)
+            {
+                ctx.request_repaint_after(USB_RECHECK_INTERVAL);
+                return;
+            }
+            log::info(&format!(
+                "USB state recheck (remaining={})",
+                self.usb_rechecks
+            ));
+            self.last_usb_refresh = Some(now);
+            self.start_refresh();
+        }
     }
 
-    fn start_usb_list(&mut self, change: UsbChange, ctx: &egui::Context) {
-        let Some(client) = self.usbipd.clone() else {
-            self.usb_listing = false;
-            return;
-        };
-        let tx = self.tx.clone();
-        let egui_ctx = ctx.clone();
-        let started = Instant::now();
-        std::thread::Builder::new()
-            .name("usb-event".to_owned())
-            .spawn(move || match client.list_devices() {
-                Ok(list) => {
+    /// 广播只负责“提醒”，增删改一律以 usbipd state 快照差集为准：
+    /// - 快照无变化 → 不重建列表、不重绘（消除附加成功后的持续刷新）。
+    /// - 设备从快照消失且上一帧处于 attached → 结束其自动附加守护进程。
+    /// - 新设备出现 → 提示用户，并由 [`App::apply_lists`] 触发自动附加。
+    fn apply_state_snapshot(&mut self, devices: Vec<UsbDevice>, ctx: &egui::Context) {
+        let first = self.state_snapshot.is_none();
+        if !first {
+            let mut prev = self.state_snapshot.clone().unwrap_or_default();
+            let mut cur = devices.clone();
+            sort_by_instance(&mut prev);
+            sort_by_instance(&mut cur);
+            if prev == cur {
+                if self.usb_activity_pending {
                     log::info(&format!(
-                        "USB change instance={} (connected={}) -> refreshed {} device(s) in {} ms",
-                        change.instance_id,
-                        change.connected,
-                        list.len(),
-                        started.elapsed().as_millis()
+                        "usbipd state unchanged ({} device(s)), activity pending",
+                        devices.len()
                     ));
-                    // SetupAPI 刚报告拔出时，usbipd state 可能仍短暂残留该设备；
-                    // 此时只发一次事件的刷新会把旧状态留在列表里，需要稍后复核一次。
-                    // 只对“未附加却仍残留”的拔出结果复核；已附加的设备在
-                    // usbipd state 中保持连接是正常的（导出状态），不再补查。
-                    let stale = !change.connected
-                        && list.iter().any(|d| {
-                            d.instance_id.eq_ignore_ascii_case(&change.instance_id)
-                                && d.is_connected
-                                && !d.is_attached
-                        });
-                    let notify = list
-                        .iter()
-                        .find(|d| d.instance_id.eq_ignore_ascii_case(&change.instance_id))
-                        .map(|d| {
-                            let status = if d.is_connected {
-                                if d.is_attached {
-                                    lang::t("ConnectedToWsl")
-                                } else {
-                                    lang::t("ConnectedToWindows")
-                                }
-                            } else {
-                                lang::t("Disconnected").to_owned()
-                            };
-                            format!("\"{}({})\" {status}.", d.short_name(), d.hardware_id)
-                        });
-                    let _ = tx.send(UiMsg::UsbNotify(notify));
-                    let _ = tx.send(UiMsg::Lists(list));
-                    let _ = tx.send(UiMsg::UsbListFinished);
-                    egui_ctx.request_repaint();
-                    if stale {
-                        log::info(&format!(
-                            "USB unplug instance={}: state still shows the device, rechecking in 1.5 s",
-                            change.instance_id
-                        ));
-                        std::thread::sleep(Duration::from_millis(1500));
-                        let _ = tx.send(UiMsg::UsbChanged(change));
-                        egui_ctx.request_repaint();
+                    // 冷却结束后由 flush_usb_activity 再查一次。
+                    ctx.request_repaint_after(USB_EVENT_COOLDOWN);
+                } else if self.usb_rechecks > 0 {
+                    self.usb_rechecks -= 1;
+                    log::info(&format!(
+                        "usbipd state unchanged ({} device(s)), rechecks left={}",
+                        devices.len(),
+                        self.usb_rechecks
+                    ));
+                    if self.usb_rechecks > 0 {
+                        ctx.request_repaint_after(USB_RECHECK_INTERVAL);
                     }
                 }
-                Err(e) => {
-                    log::warn(&format!("Failed to refresh after USB change: {e}"));
-                    let _ = tx.send(UiMsg::UsbListFinished);
-                    egui_ctx.request_repaint();
+                // 兜底轮询（无活动、无补查）时静默：无变化就不打扰。
+                return;
+            }
+        }
+
+        let previous = self.state_snapshot.clone().unwrap_or_default();
+        if !first {
+            let (removed, added) = diff_snapshots(&previous, &devices);
+            for dev in &removed {
+                log::info(&format!(
+                    "usbipd state lost device: instance={} hwid={} was_attached={}",
+                    dev.instance_id, dev.hardware_id, dev.is_attached
+                ));
+                if dev.is_attached {
+                    self.stop_daemons_for_removed(dev);
                 }
-            })
-            .expect("spawn usb event thread");
+            }
+            for dev in &added {
+                log::info(&format!(
+                    "usbipd state gained device: instance={} hwid={}",
+                    dev.instance_id, dev.hardware_id
+                ));
+            }
+            self.push_change_toasts(&removed, &added);
+        }
+        self.usb_rechecks = 0;
+        self.state_snapshot = Some(devices.clone());
+        log::info(&format!(
+            "usbipd state changed: {} -> {} device(s)",
+            previous.len(),
+            devices.len()
+        ));
+        self.apply_lists(devices);
+        ctx.request_repaint();
+    }
+
+    /// 设备已从 usbipd state 消失（物理拔出）。若它此前 attached，说明其
+    /// 自动附加守护进程应随之退出；附加中/刚附加过则跳过，避免中途误杀。
+    fn stop_daemons_for_removed(&mut self, dev: &UsbDevice) {
+        let now = Instant::now();
+        let recent = self
+            .pending_attach
+            .get(&dev.hardware_id)
+            .is_some_and(|t| now.duration_since(*t) < ATTACH_GUARD_WINDOW);
+        if recent {
+            log::info(&format!(
+                "device removal during attach window, daemon kept: hwid={}",
+                dev.hardware_id
+            ));
+            return;
+        }
+        let id = if self.cfg.app_config.use_bus_id {
+            &dev.bus_id
+        } else {
+            &dev.hardware_id
+        };
+        let attaching = self
+            .daemons
+            .lock()
+            .map(|mut dm| dm.attaching(id))
+            .unwrap_or(false);
+        if attaching {
+            log::info(&format!(
+                "device removal while attaching, daemon kept: id={id}"
+            ));
+            return;
+        }
+        let mut needles: Vec<String> = Vec::new();
+        if !dev.bus_id.is_empty() {
+            needles.push(dev.bus_id.clone());
+        }
+        if !dev.hardware_id.is_empty() {
+            needles.push(dev.hardware_id.clone());
+        }
+        if let Ok(mut dm) = self.daemons.lock() {
+            for needle in &needles {
+                dm.stop_matching(needle);
+            }
+        }
+        log::info(&format!(
+            "attached device removed, auto-attach daemon stopped: hwid={} bus={}",
+            dev.hardware_id, dev.bus_id
+        ));
+    }
+
+    fn push_change_toasts(&mut self, removed: &[&UsbDevice], added: &[&UsbDevice]) {
+        for dev in added {
+            if !dev.is_connected {
+                continue;
+            }
+            let status = if dev.is_attached {
+                lang::t("ConnectedToWsl")
+            } else {
+                lang::t("ConnectedToWindows")
+            };
+            let text = format!("\"{}({})\" {status}.", dev.short_name(), dev.hardware_id);
+            self.toasts.push(Toast {
+                kind: ToastKind::Info,
+                text,
+                expires: Instant::now() + Duration::from_secs(5),
+            });
+        }
+        for dev in removed {
+            let text = format!(
+                "\"{}({})\" {}.",
+                dev.short_name(),
+                dev.hardware_id,
+                lang::t("Disconnected")
+            );
+            self.toasts.push(Toast {
+                kind: ToastKind::Info,
+                text,
+                expires: Instant::now() + Duration::from_secs(5),
+            });
+        }
+    }
+
+    /// 兜底轮询：设备已附加到 WSL 时（无论守护进程是否由本程序管理），
+    /// Windows 广播可能不可靠，按固定间隔对 usbipd state 做差集。无变化
+    /// 时不会重建列表/重绘，因此不会出现“一直在刷新列表”。
+    pub(crate) fn poll_state_sync(&mut self, ctx: &egui::Context) {
+        if !self.initialized || self.busy {
+            return;
+        }
+        let has_attached = self
+            .state_snapshot
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|d| d.is_attached && d.is_connected));
+        if !has_attached {
+            return;
+        }
+        // 保持定时唤醒，让兜底轮询持续生效（attached 设备存在期间）。
+        ctx.request_repaint_after(ATTACHED_POLL_INTERVAL);
+        let now = Instant::now();
+        if self
+            .last_state_sync
+            .is_some_and(|t| now.duration_since(t) < ATTACHED_POLL_INTERVAL)
+        {
+            return;
+        }
+        // 广播驱动的刷新刚完成时让位于它（错峰、避免重复查询）。
+        if self
+            .last_list_at
+            .is_some_and(|t| now.duration_since(t) < ATTACHED_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.last_state_sync = Some(now);
+        self.start_refresh();
+    }
+
+    /// 自动附加被防抖推迟后的定时重试：到期时触发一次状态刷新，
+    /// 由 apply_lists -> maybe_auto_attach 完成真正的重试。
+    pub(crate) fn check_auto_retry(&mut self, ctx: &egui::Context) {
+        let Some(deadline) = self.auto_retry_at else {
+            return;
+        };
+        if Instant::now() >= deadline {
+            log::info("auto attach debounce expired, re-evaluating");
+            self.auto_retry_at = None;
+            self.need_refresh = true;
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(deadline - Instant::now());
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1300,4 +1413,80 @@ fn build_tray(
         .map_err(|e| e.to_string())?;
 
     Ok(Some((tray, show, exit)))
+}
+
+// ---------------------------------------------------------------------------
+// usbipd state snapshot diff helpers
+// ---------------------------------------------------------------------------
+
+/// 按 InstanceId 排序，使两次快照可直接用 `PartialEq` 比较顺序无关状态。
+fn sort_by_instance(list: &mut Vec<UsbDevice>) {
+    list.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+}
+
+/// 按 InstanceId（不区分大小写）计算真正消失/新增的设备。
+fn diff_snapshots<'a>(
+    prev: &'a [UsbDevice],
+    cur: &'a [UsbDevice],
+) -> (Vec<&'a UsbDevice>, Vec<&'a UsbDevice>) {
+    let removed = prev
+        .iter()
+        .filter(|d| {
+            !cur.iter()
+                .any(|c| c.instance_id.eq_ignore_ascii_case(&d.instance_id))
+        })
+        .collect();
+    let added = cur
+        .iter()
+        .filter(|d| {
+            !prev
+                .iter()
+                .any(|p| p.instance_id.eq_ignore_ascii_case(&d.instance_id))
+        })
+        .collect();
+    (removed, added)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(instance_id: &str) -> UsbDevice {
+        UsbDevice {
+            instance_id: instance_id.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn diff_detects_removed_and_added_by_instance_id() {
+        let prev = vec![
+            dev("USB\\VID_0403&PID_6001\\A50285BI"),
+            dev("USB\\VID_1234&PID_5678\\STAYS"),
+        ];
+        let cur = vec![
+            dev("USB\\VID_1234&PID_5678\\stays"),
+            dev("USB\\VID_8087&PID_0A2B\\NEWONE"),
+        ];
+        let (removed, added) = diff_snapshots(&prev, &cur);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].instance_id, "USB\\VID_0403&PID_6001\\A50285BI");
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].instance_id, "USB\\VID_8087&PID_0A2B\\NEWONE");
+    }
+
+    #[test]
+    fn same_state_in_any_order_is_not_a_change() {
+        let mut a = vec![
+            dev("USB\\VID_0403&PID_6001\\A50285BI"),
+            dev("USB\\VID_1234&PID_5678\\STAYS"),
+        ];
+        let mut b = vec![
+            dev("USB\\VID_1234&PID_5678\\STAYS"),
+            dev("USB\\VID_0403&PID_6001\\A50285BI"),
+        ];
+        sort_by_instance(&mut a);
+        sort_by_instance(&mut b);
+        assert_eq!(a, b);
+    }
 }
