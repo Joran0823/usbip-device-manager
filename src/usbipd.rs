@@ -1021,6 +1021,21 @@ pub fn attach_device(
         return Ok(String::new());
     }
 
+    // 竞态防护：调用方快照可能已过期（例如守护进程刚抢先附加成功），
+    // 执行前用最新 usbipd state 再确认一次，已附加就直接跳过，
+    // 把与其它守护进程/附加之间的竞态窗口缩到最小。
+    if let Ok(list) = usbipd.list_devices() {
+        if let Some(u) = find_device(&list, &cur.hardware_id) {
+            cur = u.clone();
+        }
+    }
+    if cur.is_attached {
+        log::info(&format!(
+            "attach skipped: id={id} is already attached (fresh state)"
+        ));
+        return Ok(String::new());
+    }
+
     let in_progress = daemons
         .lock()
         .map(|mut dm| dm.attaching(&id))
