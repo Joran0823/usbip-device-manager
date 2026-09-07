@@ -133,6 +133,8 @@ pub struct App {
     last_list_at: Option<Instant>,
     /// 上一次完整 usbipd state 快照，用于差集判断。
     state_snapshot: Option<Vec<UsbDevice>>,
+    /// 静默兜底检查是否已在途（不占用 busy，避免 spinner 每秒闪动）。
+    state_poll_inflight: bool,
     last_state_sync: Option<Instant>,
 
     show_settings: bool,
@@ -186,6 +188,7 @@ impl App {
             last_usb_refresh: None,
             last_list_at: None,
             state_snapshot: None,
+            state_poll_inflight: false,
             last_state_sync: None,
             show_settings: false,
             settings_draft: AppConfig::default(),
@@ -284,11 +287,13 @@ impl App {
                 }
                 UiMsg::Lists(devices) => {
                     self.busy = false;
+                    self.state_poll_inflight = false;
                     self.last_list_at = Some(Instant::now());
                     self.apply_state_snapshot(devices, ctx);
                 }
                 UiMsg::ListFailed(e) => {
                     self.busy = false;
+                    self.state_poll_inflight = false;
                     self.last_list_at = Some(Instant::now());
                     log::warn(&format!("usbipd state fetch failed: {e}"));
                     if self.initialized {
@@ -528,6 +533,30 @@ impl App {
                 }
             })
             .expect("spawn refresh thread");
+    }
+
+    /// 静默兜底检查：不使用 `busy`/spinner，只在结果真正变化时更新 UI。
+    /// 供“存在 attached 设备”时的低频兜底轮询调用。
+    fn start_quiet_state_poll(&mut self) {
+        if self.state_poll_inflight {
+            return;
+        }
+        let Some(client) = self.usbipd.clone() else {
+            return;
+        };
+        self.state_poll_inflight = true;
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("usbipd-state-poll".to_owned())
+            .spawn(move || match client.list_devices() {
+                Ok(list) => {
+                    let _ = tx.send(UiMsg::Lists(list));
+                }
+                Err(e) => {
+                    let _ = tx.send(UiMsg::ListFailed(e));
+                }
+            })
+            .expect("spawn quiet state poll thread");
     }
 
     fn run_op(
@@ -1084,7 +1113,7 @@ impl App {
             return;
         }
         self.last_state_sync = Some(now);
-        self.start_refresh();
+        self.start_quiet_state_poll();
     }
 
     /// 自动附加被防抖推迟后的定时重试：到期时触发一次状态刷新，

@@ -288,8 +288,8 @@ usbipd.exe state
 5. 由于 `usbipd state` 相对广播有短暂滞后，广播触发后若快照无变化会
    自动补查（600ms × 至多 2 次）；
 6. 设备已附加到 WSL 时物理拔出可能没有 Windows 通知，此时由
-   `poll_state_sync` 以 1s 间隔做兜底差集（仅在存在 attached 设备时生效，
-   无变化不重绘）。
+   `poll_state_sync` 以 1s 间隔做**静默**兜底差集（后台执行、不占用
+   busy/spinner；仅在存在 attached 设备时生效，无变化不重绘）。
 
 曾经的“插入约 7 秒后才显示”主要是旧实现每次事件都冷启动 PowerShell
 （约 276ms/次），事件风暴造成连续启动多个 PowerShell 并互相竞争；
@@ -306,6 +306,7 @@ egui 是单线程渲染模型，所有耗时工作放在后台线程，结果经
 | `usbipd-check` | 检测安装/版本 | App 启动一次 |
 | `refresh` | `list_devices()` 刷新 | 手动刷新/切页/初始化 |
 | `usbipd-op` | bind/unbind/attach/detach 等一次操作 | 每次用户操作 |
+| `usbipd-state-poll` | 静默兜底 state 差集（不置 busy，无变化不重绘） | 存在 attached 设备时每 1s |
 | `usb-monitor` | 监听 WM_DEVICECHANGE 广播（200ms 合并） | App 生命周期内 |
 | `tray-menu` | 托盘菜单事件 | 托盘存在期间 |
 
