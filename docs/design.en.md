@@ -329,9 +329,17 @@ source the UI renders from, so it cannot misreport.
    re-evaluation once the 8 s debounce expires);
 5. Because `usbipd state` lags the broadcast slightly, an unchanged snapshot
    after a broadcast triggers up to 2 extra checks 600 ms apart;
-6. There is no periodic polling at all: plug/unplug -- including the
+6. There is no idle periodic polling: plug/unplug -- including the
    export/shadow node changes that accompany removal of a device attached to
-   WSL -- produces `WM_DEVICECHANGE` broadcasts that trigger one state check.
+   WSL -- produces `WM_DEVICECHANGE` broadcasts that trigger one state check;
+7. When an auto-attach device is present but not attached,
+   `watch_auto_attach` runs a silent **200 ms x 3 rounds** fallback: each
+   round queries `usbipd state` and, if still unattached, executes one
+   `usbipd attach` (ignoring the 8 s debounce; no busy/spinner), stopping as
+   soon as the device is attached. A live `--auto-attach` daemon with an
+   unattached device is treated as stuck and killed first, so it cannot
+   block the retry as "already attaching". After 3 rounds it waits for the
+   next state change to re-arm.
 
 The old "~7 s delay after plug-in" was caused by cold-starting PowerShell
 (~276 ms each) for every event, so event bursts launched competing PowerShell
@@ -346,10 +354,11 @@ frame by the UI thread.
 
 | Thread | Responsibility | Trigger |
 | --- | --- | --- |
-| UI main thread (`logic`/`ui`) | Rendering, message draining, USB activity flush, Action dispatch | Always running |
+| UI main thread (`logic`/`ui`) | Rendering, message draining, USB activity flush, auto-attach watch, Action dispatch | Always running |
 | `usbipd-check` | Installation/version detection | Once at startup |
 | `refresh` | `list_devices()` refresh | Manual refresh/tab switch/init |
 | `usbipd-op` | One-shot bind/unbind/attach/detach operations | Per user operation |
+| `usbipd-state-poll` | Auto-attach fallback: silent 200 ms x3 queries | While an auto device is unattached |
 | `usb-monitor` | WM_DEVICECHANGE broadcast listener (200 ms coalescing) | App lifetime |
 | `tray-menu` | Tray menu events | While the tray exists |
 

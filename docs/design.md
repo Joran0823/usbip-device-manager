@@ -287,8 +287,14 @@ usbipd.exe state
    `maybe_auto_attach` 触发自动附加（8 秒防抖到期后自动补一次评估）；
 5. 由于 `usbipd state` 相对广播有短暂滞后，广播触发后若快照无变化会
    自动补查（600ms × 至多 2 次）；
-6. 不设任何周期性轮询：插拔（包括附加到 WSL 的设备拔出时伴随的导出/
-   影子节点变化）都会产生 `WM_DEVICECHANGE` 广播，触发一次 state 检查。
+6. 界面空闲时没有任何周期性任务：插拔（包括附加到 WSL 的设备拔出时伴随
+   的导出/影子节点变化）都会产生 `WM_DEVICECHANGE` 广播，触发一次 state
+   检查；
+7. auto 设备插入后若未附加，`watch_auto_attach` 会做 **200ms × 3 轮**的
+   静默兜底：每轮查询一次 `usbipd state`，未附加则执行一次 `usbipd
+   attach`（无视 8 秒防抖，不占用 busy/spinner），已附加即停止；
+   `--auto-attach` 守护进程“活着但设备未附加”会被视为卡死并先停掉，
+   避免被误判为“附加中”而阻塞重试。3 轮用完后等下一次状态变化再武装。
 
 曾经的“插入约 7 秒后才显示”主要是旧实现每次事件都冷启动 PowerShell
 （约 276ms/次），事件风暴造成连续启动多个 PowerShell 并互相竞争；
@@ -301,10 +307,11 @@ egui 是单线程渲染模型，所有耗时工作放在后台线程，结果经
 
 | 线程 | 职责 | 触发 |
 | --- | --- | --- |
-| UI 主线程（`logic`/`ui`） | 渲染、收消息、flush USB 活动、分发 Action | 常驻 |
+| UI 主线程（`logic`/`ui`） | 渲染、收消息、flush USB 活动、auto 附加兜底观察、分发 Action | 常驻 |
 | `usbipd-check` | 检测安装/版本 | App 启动一次 |
 | `refresh` | `list_devices()` 刷新 | 手动刷新/切页/初始化 |
 | `usbipd-op` | bind/unbind/attach/detach 等一次操作 | 每次用户操作 |
+| `usbipd-state-poll` | auto 附加兜底：200ms × 3 轮静默查询 | auto 设备未附加期间 |
 | `usb-monitor` | 监听 WM_DEVICECHANGE 广播（200ms 合并） | App 生命周期内 |
 | `tray-menu` | 托盘菜单事件 | 托盘存在期间 |
 

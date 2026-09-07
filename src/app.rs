@@ -25,6 +25,10 @@ const USB_RECHECK_INTERVAL: Duration = Duration::from_millis(600);
 const USB_RECHECK_LIMIT: u8 = 2;
 /// 附加过程中的宽限期，期间不因 state 差集停止守护进程。
 const ATTACH_GUARD_WINDOW: Duration = Duration::from_secs(15);
+/// auto 设备插入后未附加时的兜底检查间隔（静默查询 usbipd state）。
+const AUTO_WATCH_INTERVAL: Duration = Duration::from_millis(200);
+/// 兜底检查总轮数：每轮查询一次，未附加则执行一次附加。
+const AUTO_WATCH_ROUNDS: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
@@ -121,6 +125,14 @@ pub struct App {
     pending_attach: HashMap<String, Instant>,
     /// 自动附加被“8 秒防抖”推迟后，下一次重新评估的时间。
     auto_retry_at: Option<Instant>,
+    /// auto 设备插入后未附加的兜底检查剩余轮数（0 = 未武装）。
+    auto_watch_rounds: u8,
+    /// 3 轮兜底是否已用完（等待下一次状态变化/插拔事件重新武装）。
+    auto_watch_exhausted: bool,
+    /// 兜底观察下一次检查的时间点（200ms 节流）。
+    auto_watch_next: Option<Instant>,
+    /// 静默状态查询是否已在途（不置 busy，避免 spinner 闪烁）。
+    quiet_poll_inflight: bool,
     /// 收到 USB 广播后待处理的“查询一次 usbipd state”标记（去抖合并）。
     usb_activity_pending: bool,
     /// 广播后 state 尚未反映变化时的自动补查剩余次数。
@@ -176,6 +188,10 @@ impl App {
             need_refresh: false,
             pending_attach: HashMap::new(),
             auto_retry_at: None,
+            auto_watch_rounds: 0,
+            auto_watch_exhausted: false,
+            auto_watch_next: None,
+            quiet_poll_inflight: false,
             usb_activity_pending: false,
             usb_rechecks: 0,
             last_usb_refresh: None,
@@ -277,10 +293,12 @@ impl App {
                 }
                 UiMsg::Lists(devices) => {
                     self.busy = false;
+                    self.quiet_poll_inflight = false;
                     self.apply_state_snapshot(devices, ctx);
                 }
                 UiMsg::ListFailed(e) => {
                     self.busy = false;
+                    self.quiet_poll_inflight = false;
                     log::warn(&format!("usbipd state fetch failed: {e}"));
                     if self.initialized {
                         // 只提示，绝不清空当前列表，避免瞬时失败误杀守护进程。
@@ -431,6 +449,15 @@ impl App {
     /// Auto attach connected devices listed in the auto-attach profile
     /// (mirrors `USBDevicesViewModel.UpdateDevices`), throttled.
     fn maybe_auto_attach(&mut self) {
+        self.maybe_auto_attach_inner(false);
+    }
+
+    /// 兜底附加：无视 8 秒防抖，供“200ms × 3 轮”兜底观察使用。
+    fn maybe_auto_attach_forced(&mut self) {
+        self.maybe_auto_attach_inner(true);
+    }
+
+    fn maybe_auto_attach_inner(&mut self, ignore_debounce: bool) {
         if !self.initialized || self.busy {
             return;
         }
@@ -446,32 +473,47 @@ impl App {
             } else {
                 row.dev.hardware_id.clone()
             };
+            let recent = self
+                .pending_attach
+                .get(&row.dev.hardware_id)
+                .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(8));
+            if recent && !ignore_debounce {
+                log::info(&format!("auto attach deferred (debounce): id={id}"));
+                let expires = self
+                    .pending_attach
+                    .get(&row.dev.hardware_id)
+                    .map(|t| *t + Duration::from_secs(8))
+                    .unwrap_or(now);
+                retry_earliest = Some(
+                    retry_earliest
+                        .map(|earliest| earliest.min(expires))
+                        .unwrap_or(expires),
+                );
+                continue;
+            }
+            if ignore_debounce && recent {
+                log::info(&format!(
+                    "auto attach watchdog: retrying despite debounce: id={id}"
+                ));
+            }
+            // 守护进程还活着但设备未附加：说明 --auto-attach 守护进程卡住了
+            // （手动 usbipd attach 能成功即是佐证）。停掉它，改由本应用接管，
+            // 否则它会被误判成“附加中”而永远不再触发附加。
             let attaching = self
                 .daemons
                 .lock()
                 .map(|mut dm| dm.attaching(&id))
                 .unwrap_or(false);
-            let recent = self
-                .pending_attach
-                .get(&row.dev.hardware_id)
-                .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(8));
-            if attaching || recent {
-                log::info(&format!(
-                    "auto attach deferred: id={id} daemon_attaching={attaching} recent_attempt={recent}"
+            if attaching {
+                log::warn(&format!(
+                    "auto attach: stale daemon alive while device unattached, stopping it: id={id}"
                 ));
-                if recent && !attaching {
-                    let expires = self
-                        .pending_attach
-                        .get(&row.dev.hardware_id)
-                        .map(|t| *t + Duration::from_secs(8))
-                        .unwrap_or(now);
-                    retry_earliest = Some(
-                        retry_earliest
-                            .map(|earliest| earliest.min(expires))
-                            .unwrap_or(expires),
-                    );
+                if let Ok(mut dm) = self.daemons.lock() {
+                    dm.stop_matching(&id);
+                    if !row.dev.hardware_id.is_empty() && id != row.dev.hardware_id {
+                        dm.stop_matching(&row.dev.hardware_id);
+                    }
                 }
-                continue;
             }
             candidate = Some(row.dev.clone());
             break;
@@ -519,6 +561,30 @@ impl App {
                 }
             })
             .expect("spawn refresh thread");
+    }
+
+    /// 静默状态查询：不置 `busy`/spinner，结果只在真正变化时更新 UI。
+    /// 供 auto 附加兜底观察使用。
+    fn start_quiet_state_poll(&mut self) {
+        if self.quiet_poll_inflight {
+            return;
+        }
+        let Some(client) = self.usbipd.clone() else {
+            return;
+        };
+        self.quiet_poll_inflight = true;
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("usbipd-state-poll".to_owned())
+            .spawn(move || match client.list_devices() {
+                Ok(list) => {
+                    let _ = tx.send(UiMsg::Lists(list));
+                }
+                Err(e) => {
+                    let _ = tx.send(UiMsg::ListFailed(e));
+                }
+            })
+            .expect("spawn quiet state poll thread");
     }
 
     fn run_op(
@@ -953,6 +1019,8 @@ impl App {
             self.push_change_toasts(&removed, &added);
         }
         self.usb_rechecks = 0;
+        // 状态发生变化 = 新的插拔/刷新事件：允许兜底观察重新武装。
+        self.auto_watch_exhausted = false;
         self.state_snapshot = Some(devices.clone());
         log::info(&format!(
             "usbipd state changed: {} -> {} device(s)",
@@ -1057,6 +1125,54 @@ impl App {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(deadline - Instant::now());
+        }
+    }
+
+    /// 兜底附加：auto 设备已插入（connected && !attached）但尚未附加时，
+    /// 每 200ms 静默查询一次 usbipd state 并执行一次附加，共 3 轮；一旦
+    /// 附加成功或设备消失即停止。用完 3 轮后不再自动重试，等待下一次
+    /// 状态变化（如插拔广播触发刷新）重新武装。全程不占用 busy/spinner。
+    pub(crate) fn watch_auto_attach(&mut self, ctx: &egui::Context) {
+        if !self.initialized || self.busy {
+            return;
+        }
+        let now = Instant::now();
+        let unattached = |r: &DevRow| r.is_auto && r.dev.is_connected && !r.dev.is_attached;
+        if !self.device_rows.iter().any(unattached) {
+            self.auto_watch_rounds = 0;
+            self.auto_watch_next = None;
+            self.auto_watch_exhausted = false;
+            return;
+        }
+        if self.auto_watch_exhausted {
+            // 3 轮已用完：等待下一次状态变化/插拔事件再武装。
+            return;
+        }
+        if self.auto_watch_rounds == 0 {
+            log::info("auto attach watchdog armed: 200 ms x 3 rounds");
+            self.auto_watch_rounds = AUTO_WATCH_ROUNDS;
+            self.auto_watch_next = None;
+        }
+        ctx.request_repaint_after(AUTO_WATCH_INTERVAL);
+        if self.auto_watch_next.is_some_and(|t| now < t) {
+            return;
+        }
+        self.auto_watch_next = Some(now + AUTO_WATCH_INTERVAL);
+        self.auto_watch_rounds -= 1;
+        log::info(&format!(
+            "auto attach watchdog round {}/{}",
+            AUTO_WATCH_ROUNDS - self.auto_watch_rounds,
+            AUTO_WATCH_ROUNDS
+        ));
+        // 静默查询一次当前状态：若 usbipd 守护进程其实已完成附加，diff 会
+        // 更新快照，下个周期检测到已附加就会停止。
+        self.start_quiet_state_poll();
+        // 未附加则执行一次附加（无视 8 秒防抖）；卡死的 --auto-attach
+        // 守护进程会在 maybe_auto_attach_forced 内被清理。
+        self.maybe_auto_attach_forced();
+        if self.auto_watch_rounds == 0 {
+            self.auto_watch_exhausted = true;
+            log::warn("auto attach watchdog finished 3 rounds; device still not attached");
         }
     }
 
