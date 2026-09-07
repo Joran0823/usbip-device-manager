@@ -954,7 +954,7 @@ fn is_transient_attach_error(stderr: &str) -> bool {
 /// usbipd 提示“设备已附加到某客户端”（例如上一轮 attach 刚成功，或
 /// --auto-attach 守护进程抢先完成）。这是“其实已经附加成功”的信号，
 /// 不是失败：应通过 usbipd state 确认后按成功处理。
-fn is_already_attached_error(stderr: &str) -> bool {
+pub(crate) fn is_already_attached_error(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
     s.contains("already attached")
 }

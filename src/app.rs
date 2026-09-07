@@ -814,7 +814,7 @@ impl App {
                 } else {
                     None
                 };
-                let r = usbipd::attach_device(
+                let mut r = usbipd::attach_device(
                     &client,
                     &dev,
                     cfg_snapshot.use_bus_id,
@@ -822,6 +822,27 @@ impl App {
                     host_ip.as_deref(),
                     &daemons,
                 );
+                // 最终兜底：无论内部哪条路径漏出 “already attached”，只要
+                // 等 50ms 复查 state 确认设备已附加，就不弹错误提示框。
+                if let Err(e) = &r {
+                    if usbipd::is_already_attached_error(e) {
+                        log::info(
+                            "attach returned 'already attached'; confirming via usbipd state",
+                        );
+                        std::thread::sleep(Duration::from_millis(50));
+                        let confirmed = match client.list_devices() {
+                            Ok(list) => list.iter().any(|d| {
+                                d.hardware_id.eq_ignore_ascii_case(&dev.hardware_id)
+                                    && d.is_attached
+                            }),
+                            Err(_) => false,
+                        };
+                        if confirmed {
+                            log::info("device confirmed attached; suppressing attach error dialog");
+                            r = Ok(String::new());
+                        }
+                    }
+                }
                 done(r.map_err(|e| format!("{}: {e}", lang::t("ErrMsgAttachFail"))));
             },
             lang::t("AttachSuccess"),
