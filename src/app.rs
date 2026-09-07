@@ -1020,13 +1020,14 @@ impl App {
         let previous = self.state_snapshot.clone().unwrap_or_default();
         if !first {
             let (removed, added) = diff_snapshots(&previous, &devices);
-            // 已绑定设备拔出后，usbipd state 会保留一条“未连接”的记录
-            // （busid 清空、IsConnected=false），而不是删除整条记录。
-            // 因此“attached → 消失或不再 connected”才是物理拔出信号。
+            // 物理拔出的信号是 IsConnected 变为 false：已绑定设备拔出后
+            // usbipd state 会保留一条“未连接”记录（busid 清空），而不是
+            // 删除整条记录。attached 变 false 但设备仍连接（例如手动
+            // detach）不在此列，守护进程由 detach 流程自己停止。
             let unplugged: Vec<&UsbDevice> = previous
                 .iter()
                 .filter(|p| {
-                    if !p.is_attached {
+                    if !p.is_connected {
                         return false;
                     }
                     devices
@@ -1044,7 +1045,7 @@ impl App {
             }
             for dev in &unplugged {
                 log::info(&format!(
-                    "usbipd state: attached device unplugged: instance={} hwid={}",
+                    "usbipd state: device unplugged (IsConnected=false): instance={} hwid={}",
                     dev.instance_id, dev.hardware_id
                 ));
                 self.stop_daemons_for_removed(dev);
@@ -1070,8 +1071,9 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// 设备已物理拔出（state 中由 attached 变为消失或不再 connected）。
-    /// 立即停止对应 auto-attach 守护进程；重插后由插入检测重新附加启动。
+    /// 设备已物理拔出（IsConnected 由 true 变为 false 或记录消失）。
+    /// 立即停止对应 auto-attach 守护进程（若无匹配则无事发生）；
+    /// 重插后由插入检测重新附加启动。
     fn stop_daemons_for_removed(&mut self, dev: &UsbDevice) {
         let mut needles: Vec<String> = Vec::new();
         if !dev.bus_id.is_empty() {
@@ -1086,7 +1088,7 @@ impl App {
             }
         }
         log::info(&format!(
-            "attached device unplugged, auto-attach daemon stopped: hwid={} bus={}",
+            "device unplugged, auto-attach daemon stopped: hwid={} bus={}",
             dev.hardware_id, dev.bus_id
         ));
     }
