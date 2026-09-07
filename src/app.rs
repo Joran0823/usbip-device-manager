@@ -866,6 +866,10 @@ impl App {
     /// 每帧尝试处理合并后的 USB 事件（在 logic 与 ui 中调用）。
     pub fn flush_usb_change(&mut self, ctx: &egui::Context) {
         if self.busy || self.usb_listing {
+            if self.pending_usb.is_some() {
+                // 事件被忙碌/列表任务占用，安排重绘以便稍后继续处理。
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
             return;
         }
         let Some(change) = self.pending_usb.take() else {
@@ -912,6 +916,13 @@ impl App {
                         list.len(),
                         started.elapsed().as_millis()
                     ));
+                    // SetupAPI 刚报告拔出时，usbipd state 可能仍短暂残留该设备；
+                    // 此时只发一次事件的刷新会把旧状态留在列表里，需要稍后复核一次。
+                    let stale = !change.connected
+                        && list.iter().any(|d| {
+                            d.hardware_id.eq_ignore_ascii_case(&change.hardware_id)
+                                && d.is_connected
+                        });
                     let notify = list
                         .iter()
                         .find(|d| d.hardware_id.eq_ignore_ascii_case(&change.hardware_id))
@@ -931,6 +942,15 @@ impl App {
                     let _ = tx.send(UiMsg::Lists(list));
                     let _ = tx.send(UiMsg::UsbListFinished);
                     egui_ctx.request_repaint();
+                    if stale {
+                        log::info(&format!(
+                            "USB unplug {}: state still shows the device, rechecking in 1.5 s",
+                            change.hardware_id
+                        ));
+                        std::thread::sleep(Duration::from_millis(1500));
+                        let _ = tx.send(UiMsg::UsbChanged(change));
+                        egui_ctx.request_repaint();
+                    }
                 }
                 Err(e) => {
                     log::warn(&format!("Failed to refresh after USB change: {e}"));
