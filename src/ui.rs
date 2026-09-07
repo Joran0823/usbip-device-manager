@@ -26,6 +26,7 @@ impl eframe::App for App {
         self.process_messages(ctx);
         self.flush_usb_activity(ctx);
         self.check_auto_retry(ctx);
+        self.watch_auto_attach(ctx);
         if self.is_exiting() {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
